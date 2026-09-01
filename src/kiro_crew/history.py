@@ -193,6 +193,42 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# The subset of :data:`SLOT_OWNED_META_KEYS` a ROWS-ONLY slot save still owns.
+#
+# A save that must persist a slot's messages onto a transcript whose metadata line
+# describes a DIFFERENT live slot cannot use the whole ownership claim above: the
+# rebuild would revert the other slot's title, folder, tags or pin. Such a save
+# preserves every slot-owned field the line already carries and keeps authority
+# over only these — the file's identity and accounting, which every writer
+# maintains, and the close flags, whose absence is what makes the write
+# open-shaped and so must still erase rather than be carried forward.
+ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset(
+    {"_type", "created_at", "last_consolidated", "closed", "closed_at"}
+)
+
+# The keys a ROWS-ONLY slot save must DROP from its rebuild so the on-disk values
+# are carried back verbatim.
+#
+# Named here in full rather than derived at the call site as
+# ``SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS``, because that difference
+# under-approximates: the slot save also writes fields that DESCRIBE an owned one
+# without being owned themselves (absence must not erase them, so they are
+# deliberately outside the ownership claim and survive via
+# :func:`carry_unowned_metadata`). Deferring the described field while keeping the
+# describing one commits a line that matches NEITHER slot — worse than either,
+# because each half is separately valid and nothing downstream can detect the
+# mismatch. ``title_origin`` and ``title_refresh_mark`` are the title's provenance
+# and its background-refresh budget: read back beside another slot's title they
+# either unlock the refresh on a name a user typed by hand or lock a generated name
+# out of refresh permanently. They travel WITH the title, so they are deferred with
+# it. Every other unowned field the rebuild writes (``origin``, ``auto_tagged``,
+# ``human_seen``, ``channel_origin``, ``channel_folder_filed``) is an independent
+# sticky flag about the CONVERSATION rather than a description of a deferred field,
+# and is true of the shared transcript whichever slot writes it.
+ROWS_ONLY_DEFERRED_META_KEYS: frozenset[str] = (
+    SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS
+) | frozenset({"title_origin", "title_refresh_mark"})
+
 
 def carry_unowned_metadata(
     rebuilt: dict,

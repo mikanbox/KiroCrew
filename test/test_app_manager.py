@@ -1273,6 +1273,18 @@ class TestCopyAppTree:
         (src / ".git" / "config").write_text("[core]")
         (src / "__pycache__").mkdir()
         (src / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+        # The gateway's own pip --target provisioning output: machine- and
+        # platform-specific, re-provisioned at the destination on first spawn.
+        # Copying it would put a foreign wheel tree FIRST on the child's
+        # PYTHONPATH, shadowing the correctly provisioned copy. The transient
+        # staging/prior swap directories are denylisted for the same reason.
+        (src / ".kirocrew-deps").mkdir()
+        (src / ".kirocrew-deps" / "requests").mkdir()
+        (src / ".kirocrew-deps" / "requests" / "__init__.py").write_text("x = 1")
+        (src / ".kirocrew-deps-staging").mkdir()
+        (src / ".kirocrew-deps-staging" / "partial.py").write_text("x = 1")
+        (src / ".kirocrew-deps-prior").mkdir()
+        (src / ".kirocrew-deps-prior" / "old.py").write_text("x = 1")
         # A real `build/` dir is NOT denylisted: the manifest may reference
         # runtime paths anywhere under the app root, so it must survive.
         # (A `build` *symlink* is neutralized by symlinks=True instead.)
@@ -1288,6 +1300,9 @@ class TestCopyAppTree:
         assert not (dest / "ui" / "node_modules").exists()
         assert not (dest / ".git").exists()
         assert not (dest / "__pycache__").exists()
+        assert not (dest / ".kirocrew-deps").exists()
+        assert not (dest / ".kirocrew-deps-staging").exists()
+        assert not (dest / ".kirocrew-deps-prior").exists()
         assert (dest / "build" / "artifact.txt").is_file()
         assert (dest / "ui" / "dist" / "index.mjs").is_file()
 

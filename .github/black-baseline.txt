@@ -15,7 +15,6 @@ src/kiro_crew/acp/session_handle.py
 src/kiro_crew/acp/worker_pool.py
 src/kiro_crew/apps/__init__.py
 src/kiro_crew/apps/app_storage.py
-src/kiro_crew/apps/backend.py
 src/kiro_crew/apps/bridges.py
 src/kiro_crew/apps/builtins/auto_improvement/backend/routes.py
 src/kiro_crew/apps/builtins/auto_improvement/spine/gate.py
@@ -431,7 +430,6 @@ test/test_api_server.py
 test/test_api_shutdown.py
 test/test_app_backend.py
 test/test_app_backend_stale_reap.py
-test/test_app_bridges.py
 test/test_app_cli.py
 test/test_app_config_self_heal.py
 test/test_app_context.py
@@ -448,7 +446,6 @@ test/test_app_scaffold.py
 test/test_app_storage.py
 test/test_approval_and_update_task.py
 test/test_approval_threading.py
-test/test_apps_backend_coverage.py
 test/test_apps_instances_loop_offload.py
 test/test_apps_registry.py
 test/test_apps_registry_coverage.py

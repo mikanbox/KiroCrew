@@ -385,13 +385,26 @@ def _check_path_safety(path: str) -> bool:
 # Build-input / VCS directories never needed at runtime.  The app-kit runtime
 # layout is ``app.json`` + backend code + ``ui/dist/`` — ``node_modules`` is
 # npm build input and ``.git`` comes from cloned registry sources.
+# ``.kirocrew-deps`` (plus its transient staging/prior siblings) is the
+# gateway's own ``pip --target`` provisioning of the app's requirements.txt:
+# machine- and platform-specific, re-provisioned at the destination on first
+# spawn, and copying it would put a foreign wheel tree FIRST on the child's
+# PYTHONPATH, shadowing the correctly provisioned copy.
 # ``shutil.ignore_patterns`` matches by basename at every depth, so both
 # ``node_modules`` and ``ui/node_modules`` are dropped.  ``build`` is
 # deliberately NOT listed: the manifest may reference runtime paths anywhere
 # under the app root, and silently dropping a manifest-referenced directory
 # would record a successful install with missing files.  A ``build`` symlink
 # into a huge build tree is already neutralized by ``symlinks=True``.
-_COPY_IGNORE = ("node_modules", ".git", "__pycache__", ".venv")
+_COPY_IGNORE = (
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".venv",
+    ".kirocrew-deps",
+    ".kirocrew-deps-staging",
+    ".kirocrew-deps-prior",
+)
 
 
 def _copy_app_tree(source: Path, dest: Path) -> None:

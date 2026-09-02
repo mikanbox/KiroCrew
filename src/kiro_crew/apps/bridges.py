@@ -30,7 +30,7 @@ from kiro_crew.apps.execution import (
     app_execution_denied,
     shipped_builtin_app_root,
 )
-from kiro_crew.apps.interpreter import resolve_app_python, venv_provided_command
+from kiro_crew.apps.interpreter import app_deps_dir, resolve_app_python, venv_provided_command
 from kiro_crew.apps.manager import (
     app_data_dir,
     app_dir,
@@ -1962,9 +1962,10 @@ def _live_port_for(app_name: str, live_port: int | None) -> int | None:
 
 
 #: Bare python launchers an app manifest may name. Each is substituted with a resolved
-#: absolute interpreter — the app's own venv python when it exists (the interpreter its
-#: dependencies were installed against), else the RUNNING interpreter, which is the only
-#: one guaranteed to import ``kiro_crew``.
+#: absolute interpreter — the RUNNING interpreter when the gateway provisioned the app's
+#: deps dir (its wheels are ABI-bound to that interpreter), else the app's own venv
+#: python when a version-matched one exists, else the RUNNING interpreter, which is the
+#: only one guaranteed to import ``kiro_crew``.
 _BARE_PYTHON = frozenset({"python", "python3", "py"})
 
 
@@ -1981,19 +1982,22 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
     entry for exactly that reason; this is the same decision for app manifests.
 
     With ``app_root``, the resolution matches what the app's BACKEND launcher already does
-    (see :mod:`kiro_crew.apps.interpreter`): prefer the app's own venv interpreter — that is
-    where its ``requirements.txt`` was installed, so anything else risks starting the server
-    under an interpreter missing the app's dependencies — else fall back to the gateway's
-    ``sys.executable``. The two spawn paths share one policy on purpose; a second divergent
-    copy is the defect this shape removes.
+    (see :mod:`kiro_crew.apps.interpreter`): the gateway's ``sys.executable`` whenever the
+    gateway has provisioned the app's deps dir (``pip install --target`` — those wheels are
+    ABI-bound to that interpreter), else the app's own venv interpreter when a
+    version-matched one exists, else ``sys.executable`` — and expose the provisioned deps
+    dir through ``PYTHONPATH`` exactly as the backend spawn env does, EXCEPT to a server
+    launching a ``kiro_crew`` module, which must never see an app-supplied ``kiro_crew``
+    copy. The two spawn paths share one policy on purpose; a second divergent copy is the
+    defect this shape removes.
 
     The rewrite rule, precisely: only a BARE name (no path separator) is ever touched, and
-    then only when it is a known python launcher OR the app's venv provides that exact
-    binary (a venv console script — invisible to PATH because the venv is never activated).
-    An absolute path, a command carrying a path, or a bare PATH dependency the venv does not
-    provide (``node``, ``npx``, ``docker``) was chosen deliberately and is left untouched, as
-    is an HTTP entry (no ``command``). Getting this predicate wrong breaks working apps, so
-    the boundary is pinned by tests on both sides.
+    then only when it is a known python launcher OR the app's venv or deps dir provides that
+    exact binary (a pip console script — invisible to PATH because neither layout is ever
+    activated). An absolute path, a command carrying a path, or a bare PATH dependency the
+    app does not provide (``node``, ``npx``, ``docker``) was chosen deliberately and is left
+    untouched, as is an HTTP entry (no ``command``). Getting this predicate wrong breaks
+    working apps, so the boundary is pinned by tests on both sides.
     """
     command = cfg.get("command")
     if not isinstance(command, str):
@@ -2039,6 +2043,30 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
         venv_cmd = venv_provided_command(app_root, name)
         if venv_cmd is not None:
             cfg["command"] = venv_cmd
+    if app_root is not None and not _targets_gateway_module(cfg):
+        # Expose the provisioned deps dir the same way the backend spawn env
+        # does: a --target install carries no interpreter, so PYTHONPATH is the
+        # only bridge — a deps-provided console script's shebang is
+        # sys.executable and imports its own package from here, and a
+        # python-launcher server imports the app's requirements from here.
+        # Prepended so the app's pinned requirements win over a manifest's own
+        # PYTHONPATH. Inert for non-Python commands, and skipped entirely when
+        # the app has no provisioned deps dir. NEVER injected into a server
+        # that launches a kiro_crew module: an app that pip-pins its own
+        # kiro_crew copy would otherwise shadow the gateway's code with a
+        # foreign version on the gateway's own interpreter — the same reason
+        # _targets_gateway_module pins sys.executable above. Registration can
+        # precede the first backend spawn (which provisions the dir); the
+        # boot/enable re-registration then picks it up — same ordering the
+        # venv had.
+        deps_dir = app_deps_dir(app_root)
+        if deps_dir.is_dir():
+            env = dict(cfg.get("env") or {})
+            existing = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = (
+                f"{deps_dir}{os.pathsep}{existing}" if existing else str(deps_dir)
+            )
+            cfg["env"] = env
     return cfg
 
 

@@ -3,18 +3,22 @@
 When an app declares a ``backend`` section in its manifest, KiroCrew manages
 the backend process lifecycle: spawn on enable, health-check, stop on disable.
 """
+
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import http.client
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import urllib.error
@@ -30,7 +34,7 @@ from kiro_crew.apps.execution import (
     shipped_builtin_app_root,
     shipped_builtin_module_path,
 )
-from kiro_crew.apps.interpreter import resolve_app_python, venv_python_path
+from kiro_crew.apps.interpreter import app_deps_dir, resolve_app_python
 from kiro_crew.apps.manager import app_dir, get_app_manifest, list_apps
 from kiro_crew.apps.registry import minimal_env
 from kiro_crew.atomic_write import atomic_write
@@ -44,6 +48,7 @@ from kiro_crew.sandbox import (
     run_limited,
     wrap_argv,
 )
+from kiro_crew.security import redact_credentials
 from kiro_crew.sel import sel
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -245,7 +250,8 @@ def _capture_adopted_owners(
         logger.warning(
             "App %s: cannot record owning PIDs on 127.0.0.1:%d "
             "(port->PID tool unavailable?) — skipping adoption",
-            app_name, port,
+            app_name,
+            port,
         )
         return None
     start_times: dict[int, str] = {}
@@ -263,24 +269,28 @@ def _capture_adopted_owners(
             "App %s: start-time identity unreadable for owner PID(s) %s on "
             "port %d — refusing adoption (an owner that cannot be identified "
             "cannot be stopped later)",
-            app_name, sorted(set(owners) - set(start_times)), port,
+            app_name,
+            sorted(set(owners) - set(start_times)),
+            port,
         )
         return None
     if not _probe_adoption_health(port, health_path):
         logger.warning(
             "App %s: backend on port %d stopped answering its health check "
             "while ownership was being recorded — skipping adoption",
-            app_name, port,
+            app_name,
+            port,
         )
         return None
-    owners_recheck = platform_compat.loopback_owner_pids(
-        platform_compat.find_port_listeners(port)
-    )
+    owners_recheck = platform_compat.loopback_owner_pids(platform_compat.find_port_listeners(port))
     if set(owners_recheck) != set(owners):
         logger.warning(
             "App %s: port %d owners changed while ownership was being recorded "
             "(%s -> %s) — skipping adoption",
-            app_name, port, owners, owners_recheck,
+            app_name,
+            port,
+            owners,
+            owners_recheck,
         )
         return None
     return owners, start_times
@@ -308,9 +318,7 @@ def _pid_is_self_or_descendant_of(pid: int, ancestor: int) -> bool:
 def _spawn_owns_listener(port: int, spawn_pid: int) -> bool:
     """Whether the listener on *port* is our spawn (or one of its descendants)."""
 
-    return any(
-        _pid_is_self_or_descendant_of(pid, spawn_pid) for pid in _listening_pids(port)
-    )
+    return any(_pid_is_self_or_descendant_of(pid, spawn_pid) for pid in _listening_pids(port))
 
 
 def _reserve_free_port(app_name: str) -> int:
@@ -364,6 +372,7 @@ def _claim_port(app_name: str, port: int) -> None:
 # ---------------------------------------------------------------------------
 # Process tracking
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class AppProcess:
@@ -425,12 +434,44 @@ _processes: dict[str, AppProcess] = {}  # app_name -> AppProcess
 # app backend keeps the standard (operator-configurable) resource policy.
 _BUILD_CAPABLE_APPS = frozenset({"dev-fleet"})
 
+# requirements.txt provisioning (pip --target into apps/interpreter.app_deps_dir).
+# The stamp records the digest a successful install came from (requirements
+# bytes + the installing interpreter's ABI tag — see _deps_digest), so a start
+# where neither changed skips pip entirely. Staging/prior are transient swap
+# directories: pip fills staging, success renames it live, and prior briefly
+# holds the outgoing install so a failure at any point leaves either the old
+# tree or the new one — never a half-replaced mix.
+_DEPS_STAMP_NAME = ".requirements-sha256"
+_DEPS_STAGING_NAME = ".kirocrew-deps-staging"
+_DEPS_PRIOR_NAME = ".kirocrew-deps-prior"
+
+
+def _deps_digest(requirements: bytes) -> str:
+    """Stamp digest for a provisioned deps dir.
+
+    Folds the installing interpreter's cache tag (e.g. ``cpython-312``), the
+    platform tag (e.g. ``macosx-11.0-arm64``), AND the full interpreter
+    version in with the requirements bytes: wheels installed by
+    ``pip --target`` are ABI- and architecture-specific, and a
+    requirements.txt can carry ``python_full_version`` environment markers
+    that flip on a PATCH upgrade — so after a gateway Python upgrade of any
+    granularity, or a cross-architecture home migration, an UNCHANGED
+    requirements.txt must still reprovision. A requirements-only stamp would
+    skip pip and leave a stale or incompatible install live.
+    """
+    tag = sys.implementation.cache_tag or ""
+    plat = sysconfig.get_platform()
+    pyver = platform.python_version()
+    return hashlib.sha256(f"{tag}\n{plat}\n{pyver}\n".encode() + requirements).hexdigest()
+
+
 _lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
 # Node.js binary resolution
 # ---------------------------------------------------------------------------
+
 
 def _resolve_nvm_path(binary_name: str) -> str | None:
     """Resolve a binary via nvm, returning its full path or None.
@@ -541,6 +582,7 @@ def _shebang_argv(entry: Path) -> list[str]:
 # Lifecycle
 # ---------------------------------------------------------------------------
 
+
 def start_app_backend(app_name: str) -> AppProcess | None:
     """Start an app's backend process if it declares one.
 
@@ -559,7 +601,9 @@ def start_app_backend(app_name: str) -> AppProcess | None:
                 logger.info("App %s backend already running (pid %d)", app_name, existing.pid)
                 return existing
             if existing.proc is None and existing.adopted_pids:
-                logger.info("App %s backend already adopted (pids %s)", app_name, existing.adopted_pids)
+                logger.info(
+                    "App %s backend already adopted (pids %s)", app_name, existing.adopted_pids
+                )
                 return existing
             # A concurrent start_app_backend is mid-spawn for this app (placeholder with
             # ``starting=True``). Without this guard two callers (gateway boot-reconcile
@@ -572,7 +616,9 @@ def start_app_backend(app_name: str) -> AppProcess | None:
                 await_inflight = True
         if not await_inflight:
             # Reserve a STARTING placeholder so a concurrent call sees this spawn in flight.
-            _processes[app_name] = AppProcess(app_name=app_name, starting=True, started_at=time.time())
+            _processes[app_name] = AppProcess(
+                app_name=app_name, starting=True, started_at=time.time()
+            )
     if await_inflight:
         logger.info("App %s backend is already starting — awaiting the in-flight spawn", app_name)
         return _await_inflight_spawn(app_name)
@@ -697,12 +743,16 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
             if not entry.resolve().is_relative_to(root.resolve()):
                 logger.error(
                     "App %s backend entry point escapes app root: %s (resolved %s)",
-                    app_name, entry, entry.resolve(),
+                    app_name,
+                    entry,
+                    entry.resolve(),
                 )
                 return None
         except (OSError, ValueError):
             logger.error(
-                "App %s backend entry point path resolution failed: %s", app_name, entry,
+                "App %s backend entry point path resolution failed: %s",
+                app_name,
+                entry,
             )
             return None
 
@@ -718,7 +768,10 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
             if not (_MIN_PORT <= port <= _MAX_PORT):
                 logger.error(
                     "App %s: port %d outside allowed range %d-%d",
-                    app_name, port, _MIN_PORT, _MAX_PORT,
+                    app_name,
+                    port,
+                    _MIN_PORT,
+                    _MAX_PORT,
                 )
                 return None
             # Claim it immediately so a concurrently-starting auto-port app cannot
@@ -751,8 +804,10 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
             if healthy:
                 try:
                     sel().log_api_access(
-                        caller="gateway", operation="app_backend_adopt",
-                        outcome="adopted", resources=f"{app_name} port={port}",
+                        caller="gateway",
+                        operation="app_backend_adopt",
+                        outcome="adopted",
+                        resources=f"{app_name} port={port}",
                     )
                 except Exception as exc:
                     logger.debug("SEL audit failed for app %s backend adopt: %s", app_name, exc)
@@ -767,16 +822,24 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                 # stop can refuse a recycled PID, and the capture is sandwiched
                 # between health checks so a responder that exits mid-capture
                 # cannot hand ownership to a bystander.
-                adopted = _capture_adopted_owners(
-                    app_name, port, manifest.backend.healthCheck
-                )
+                adopted = _capture_adopted_owners(app_name, port, manifest.backend.healthCheck)
                 if adopted is None:
                     return None
                 adopted_pids, adopted_start_times = adopted
-                logger.info("App %s: healthy instance already on port %d — adopting (pids=%s)", app_name, port, adopted_pids)
+                logger.info(
+                    "App %s: healthy instance already on port %d — adopting (pids=%s)",
+                    app_name,
+                    port,
+                    adopted_pids,
+                )
                 ap = AppProcess(
-                    app_name=app_name, port=port, pid=0, proc=None,
-                    healthy=True, started_at=time.time(), log_path=str(log_path),
+                    app_name=app_name,
+                    port=port,
+                    pid=0,
+                    proc=None,
+                    healthy=True,
+                    started_at=time.time(),
+                    log_path=str(log_path),
                     adopted_pids=adopted_pids,
                     adopted_start_times=adopted_start_times,
                 )
@@ -803,7 +866,8 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
             else:
                 try:
                     sel().log_api_access(
-                        caller="gateway", operation="app_backend_spawn",
+                        caller="gateway",
+                        operation="app_backend_spawn",
                         outcome="rejected_port_unhealthy",
                         resources=f"{app_name} port={port}",
                     )
@@ -811,47 +875,193 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                     logger.debug("SEL audit failed for app %s port rejection: %s", app_name, exc)
                 logger.warning(
                     "App %s: port %d occupied by unhealthy process — "
-                    "kill it manually then retry", app_name, port,
+                    "kill it manually then retry",
+                    app_name,
+                    port,
                 )
                 return None
         except OSError:
             pass  # port is free — proceed to spawn
 
-    # Install Python dependencies into a per-app venv (isolated from KiroCrew runtime)
+    # Install Python dependencies into a per-app deps dir (isolated from the
+    # Kiro Crew runtime). `pip install --target` rather than a venv: packaged
+    # installs bundle an interpreter that ships pip but no ensurepip, so
+    # `-m venv` dies after creating the directory skeleton — and the venv-first
+    # interpreter policy would then prefer that skeleton while it holds none of
+    # the app's dependencies. A --target install needs no bootstrap and works
+    # identically under packaged and source installs; the deps dir reaches the
+    # child via PYTHONPATH (set where the spawn env is built below).
+    # sys.executable, never a bare "python3": the bare name relies on PATH
+    # (absent on some hosts, a Store stub on Windows) — the same policy every
+    # app spawn path applies via apps/interpreter.
+    #
+    # The install is stamp-gated and staged:
+    # - A hash of requirements.txt is stamped into the deps dir on success, and
+    #   a matching stamp skips pip entirely — so a restart with unchanged
+    #   requirements does no network work and an OFFLINE restart of a healthy
+    #   backend raises no alarm (pip --target cannot answer "already
+    #   satisfied" the way a venv install could).
+    # - pip installs into a staging dir that is swapped in only on success, so
+    #   an interrupted or failed (re)install can never corrupt the live deps
+    #   dir in place — the prior good install keeps serving the spawn below.
     req_file = root / "requirements.txt"
-    if req_file.is_file():
-        venv_dir = root / ".venv"
-        _env = minimal_env()  # don't leak secrets to pip/venv subprocesses
+    provision_error = ""
+    # entry is None means a module-style builtin: it executes TRUSTED code from
+    # inside the kiro_crew package, not from this writable app dir. Provisioning
+    # a requirements.txt found here (or injecting a .kirocrew-deps the agent
+    # could have written) would let agent-authored wheels load ahead of the
+    # trusted module on its PYTHONPATH — a trust-boundary crossing. Builtins
+    # declare their dependencies in the package's own pyproject, so they never
+    # need this path; gate it (and the PYTHONPATH injection below) on a real
+    # file entry point.
+    if entry is not None and req_file.is_file():
+        # The app dir is app-writable, so requirements.txt can be a planted
+        # symlink. Resolve it and require containment in the app root —
+        # stricter than a sensitive-path denylist, refusing EVERY outside
+        # target: reading an outside file's bytes would turn the on-disk
+        # stamp into a sha256 content oracle for that file (app code can
+        # read the stamp and confirm guesses of the target's content), and
+        # pip would install from a path the app cannot otherwise reach.
         try:
-            if not venv_dir.exists():
-                # sys.executable, never a bare "python3": the bare name relies on
-                # PATH (absent on some hosts, a Store stub on Windows) — the same
-                # policy every app spawn path applies via apps/interpreter.
-                venv_cmd, _ = wrap_argv(
-                    [sys.executable, "-m", "venv", str(venv_dir)], mode="standard"
+            req_contained = req_file.resolve(strict=True).is_relative_to(root.resolve(strict=True))
+        except OSError:
+            req_contained = False
+        if not req_contained:
+            provision_error = (
+                f"Refusing requirements.txt for app {app_name}: it resolves "
+                f"outside the app directory (symlinked requirements are not "
+                f"installed)"
+            )
+            logger.error("%s", provision_error)
+    if entry is not None and req_file.is_file() and not provision_error:
+        deps_dir = app_deps_dir(root)
+        prior = root / _DEPS_PRIOR_NAME
+        # Recover from an interrupted swap: a crash between the two renames
+        # below leaves only the outgoing tree under the prior name. Put it
+        # back before the stamp check, so an offline restart still has its
+        # last good install (and a matching stamp skips pip entirely).
+        if not deps_dir.exists() and prior.exists():
+            try:
+                prior.rename(deps_dir)
+            except OSError as exc:
+                logger.warning("App %s: could not recover interrupted deps swap: %s", app_name, exc)
+        stamp = deps_dir / _DEPS_STAMP_NAME
+        try:
+            digest = _deps_digest(req_file.read_bytes())
+        except OSError:
+            digest = ""
+        try:
+            provisioned = bool(digest) and stamp.read_text(encoding="utf-8").strip() == digest
+        except OSError:
+            provisioned = False
+        if not provisioned:
+            staging = root / _DEPS_STAGING_NAME
+            _env = minimal_env()  # don't leak secrets to pip subprocesses
+            try:
+                # Strict cleanup, inside the try: pip --target does not
+                # replace a distribution already present in the target, so a
+                # leftover staging tree that survives a best-effort delete
+                # would be filled around, stamped valid, and swapped live as a
+                # mixed old/new install. If the old staging cannot be removed,
+                # provisioning must fail loudly instead (the prior good
+                # install keeps serving the spawn).
+                if staging.exists():
+                    shutil.rmtree(staging)
+                staging.mkdir(parents=True, exist_ok=True)
+                pip_cmd, _ = wrap_argv(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--quiet",
+                        "--disable-pip-version-check",
+                        "--target",
+                        str(staging),
+                        "-r",
+                        str(req_file),
+                    ],
+                    mode="standard",
                 )
-                venv_cmd = cgroup_scope_argv(venv_cmd)  # cgroup DoS ceiling
+                pip_cmd = cgroup_scope_argv(pip_cmd)  # cgroup DoS ceiling
+                # check=True: a non-zero pip exit IS a provisioning failure. It
+                # must not be discarded — the backend would spawn without its
+                # dependencies and die on an import error pointing at the app.
                 run_limited(
-                    venv_cmd,
-                    check=True, capture_output=True, timeout=60, env=_env,
+                    pip_cmd,
+                    check=True,
+                    capture_output=True,
+                    timeout=60,
+                    env=_env,
                 )
-            # Invoke pip through the venv's own interpreter: `.venv/bin/pip` is
-            # POSIX-only (Windows venvs ship Scripts\), and `<venv python> -m pip`
-            # is the layout-independent spelling. Without it a Windows venv is
-            # created but never provisioned — and would then be preferred by the
-            # venv-first interpreter policy while holding none of the app's deps.
-            venv_python = str(venv_python_path(root))
-            pip_cmd, _ = wrap_argv(
-                [venv_python, "-m", "pip", "install", "--quiet",
-                 "--disable-pip-version-check", "-r", str(req_file)], mode="standard"
-            )
-            pip_cmd = cgroup_scope_argv(pip_cmd)  # cgroup DoS ceiling
-            run_limited(
-                pip_cmd,
-                capture_output=True, timeout=60, env=_env,
-            )
-        except Exception as exc:
-            logger.warning("Failed to install deps for app %s: %s", app_name, exc)
+                if digest:
+                    # atomic_write, not write_text: it writes a unique temp
+                    # file and renames over the destination, so a stamp-named
+                    # symlink a malicious sdist build hook planted inside
+                    # staging is REPLACED rather than followed (write_text
+                    # would write through it into an arbitrary same-user
+                    # file). The pip child is sandboxed, but this write is the
+                    # gateway's own.
+                    atomic_write(staging / _DEPS_STAMP_NAME, digest)
+                # Swap the fresh install live. Two renames, not an in-place
+                # upgrade, so no state mixes old and new trees; the recovery
+                # above (and the restore in the except arm) covers the window
+                # in which only the prior name exists.
+                shutil.rmtree(prior, ignore_errors=True)
+                if deps_dir.exists():
+                    deps_dir.rename(prior)
+                staging.rename(deps_dir)
+                shutil.rmtree(prior, ignore_errors=True)
+            except Exception as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                # If the failure hit between the swap renames (e.g. a locked
+                # directory on Windows), the live name is empty and the good
+                # tree sits under the prior name — put it back.
+                if not deps_dir.exists() and prior.exists():
+                    try:
+                        prior.rename(deps_dir)
+                    except OSError as restore_exc:
+                        logger.warning(
+                            "App %s: could not restore prior deps after failed swap: %s",
+                            app_name,
+                            restore_exc,
+                        )
+                detail = str(exc)
+                stderr = getattr(exc, "stderr", None)
+                if stderr:
+                    if isinstance(stderr, bytes):
+                        stderr = stderr.decode("utf-8", "replace")
+                    # Redact BEFORE truncating: a suffix cut can split a
+                    # credential from the marker the redactor matches on,
+                    # leaving the secret's tail to survive the pass below —
+                    # the same split-across-a-length-cap shape the MCP report
+                    # capture guards against. pip errors can echo an index
+                    # URL carrying credentials
+                    # (`--index-url https://user:token@host/`); this detail
+                    # reaches the gateway log and the user-visible backend log.
+                    stderr, _ = redact_credentials(stderr.strip())
+                    detail = f"{detail}: {stderr[-400:]}"
+                detail, _ = redact_credentials(detail)
+                provision_error = (
+                    f"Failed to install requirements.txt dependencies for app "
+                    f"{app_name}: {detail}"
+                )
+                # The spawn is still attempted: the deps dir may hold a
+                # previous successful install, and some requirements are
+                # optional. The failure is surfaced instead of swallowed: an
+                # error log here, and a header line in the backend's own log so
+                # the import error missing deps produce points back at
+                # provisioning.
+                logger.error("%s", provision_error)
+                try:
+                    sel().log_api_access(
+                        caller="gateway",
+                        operation="app_backend_spawn",
+                        outcome="deps_provision_failed",
+                        resources=app_name,
+                    )
+                except Exception as sel_exc:
+                    logger.debug("SEL audit failed for app %s deps failure: %s", app_name, sel_exc)
 
     # Spawn process — use manifest backend type if available, fall back to heuristic
     # Pass the gateway's resolved config home explicitly: under pods or any
@@ -975,6 +1185,21 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
             env["KIROCREW_PROXY_SECRET"] = _proxy_secret
     except OSError:
         pass
+    # Expose the provisioned deps dir (pip --target, above) to the child.
+    # PYTHONPATH rather than an interpreter switch: it is honored identically
+    # by the app's own venv interpreter and the gateway fallback, on every
+    # platform. Prepended so the app's pinned requirements win over anything
+    # the operator's own PYTHONPATH (passed through by minimal_env) carries.
+    # Gated on the dir existing AND a real file entry point: a module-style
+    # builtin (entry is None) runs trusted package code, and must not have an
+    # agent-writable app dir injected ahead of it (same trust boundary as the
+    # provisioning gate above).
+    _deps_dir = app_deps_dir(root)
+    if entry is not None and _deps_dir.is_dir():
+        _existing_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            f"{_deps_dir}{os.pathsep}{_existing_pp}" if _existing_pp else str(_deps_dir)
+        )
     entry_str = str(entry) if entry else entry_point
 
     # Prefer explicit backend type from manifest over content sniffing
@@ -984,9 +1209,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
     # Note: module-style entry points (entry is None) are always Python
     # builtin apps and never declare a Node.js backend, so this branch is
     # safe to evaluate before the module-style branch below.
-    if entry is not None and (backend_type == "node" or (
-        not backend_type and entry_str.endswith((".js", ".mjs", ".cjs"))
-    )):
+    if entry is not None and (
+        backend_type == "node" or (not backend_type and entry_str.endswith((".js", ".mjs", ".cjs")))
+    ):
         node_bin = _find_node_binary()
         if not node_bin:
             logger.error(
@@ -1009,8 +1234,10 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                 logger.info("Installing npm deps for app %s", app_name)
                 try:
                     sel().log_api_access(
-                        caller="gateway", operation="app_backend_npm_install",
-                        outcome="started", resources=f"{app_name}",
+                        caller="gateway",
+                        operation="app_backend_npm_install",
+                        outcome="started",
+                        resources=f"{app_name}",
                     )
                 except Exception as exc:
                     logger.debug("SEL audit failed for npm install %s: %s", app_name, exc)
@@ -1019,12 +1246,13 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                         [npm_bin, "install", "--production", "--no-audit", "--no-fund"],
                         mode="standard",
                     )
-                    sandboxed_npm = cgroup_scope_argv(
-                        sandboxed_npm
-                    )  # cgroup DoS ceiling
+                    sandboxed_npm = cgroup_scope_argv(sandboxed_npm)  # cgroup DoS ceiling
                     run_limited(
                         sandboxed_npm,
-                        cwd=str(root), env=env, capture_output=True, timeout=120,
+                        cwd=str(root),
+                        env=env,
+                        capture_output=True,
+                        timeout=120,
                     )
                 except Exception as exc:
                     logger.warning("Failed to install npm deps for app %s: %s", app_name, exc)
@@ -1073,9 +1301,7 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         cwd = str(root)
 
     # --- ASGI (Python) backend ---
-    elif backend_type == "asgi" or (
-        not backend_type and _is_asgi_entry(entry)
-    ):
+    elif backend_type == "asgi" or (not backend_type and _is_asgi_entry(entry)):
         # Prefer the app's venv interpreter, else the gateway's own (sys.executable) —
         # never a bare "python3": a bare name relies on PATH, which isn't guaranteed
         # (e.g. some build environments ship only a versioned interpreter, so
@@ -1093,11 +1319,16 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
             cwd = str(root)
             module_path = ".".join(parts).removesuffix(".py")
         cmd = [
-            python_bin, "-m", "uvicorn",
+            python_bin,
+            "-m",
+            "uvicorn",
             f"{module_path}:app",
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--log-level", "warning",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "warning",
         ]
 
     # --- Plain Python backend (default) ---
@@ -1158,18 +1389,29 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
     sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
 
     logger.info(
-        "Spawning app %s backend: %s", app_name, " ".join(sandboxed_cmd),
+        "Spawning app %s backend: %s",
+        app_name,
+        " ".join(sandboxed_cmd),
     )
     try:
         sel().log_api_access(
-            caller="gateway", operation="app_backend_spawn",
-            outcome="started", resources=f"{app_name} port={port}",
+            caller="gateway",
+            operation="app_backend_spawn",
+            outcome="started",
+            resources=f"{app_name} port={port}",
         )
     except Exception as exc:
         logger.debug("SEL audit failed for app %s backend spawn: %s", app_name, exc)
 
     try:
         log_fh = open(log_path, "w")
+        if provision_error:
+            # Put the real cause at the top of the backend's own (user-visible)
+            # log: the import error missing deps produce reads as an app bug,
+            # and this line points it back at provisioning. Written and flushed
+            # before the spawn, so the child's inherited fd appends after it.
+            log_fh.write(f"[kiro-crew] {provision_error}\n")
+            log_fh.flush()
         # Process-group isolation so stop_app_backend can tree-kill the app. Pass
         # both flags explicitly (NOT via **dict unpack — that breaks mypy's Popen
         # overload resolution on the build fleet): start_new_session=True is a
@@ -1188,9 +1430,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                 # ceiling: the backend is the ANCESTOR of its build workloads
                 # (vite/pip) and a 1024 hard cap starves every descendant.
                 # All other apps keep the standard configured policy.
-                profile=(RLIMIT_PROFILE_BUILD
-                         if app_name in _BUILD_CAPABLE_APPS
-                         else RLIMIT_PROFILE_TOOL),
+                profile=(
+                    RLIMIT_PROFILE_BUILD if app_name in _BUILD_CAPABLE_APPS else RLIMIT_PROFILE_TOOL
+                ),
             )
         except OSError:
             log_fh.close()
@@ -1219,7 +1461,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         collided = "address already in use" in tail.lower() or "errno 98" in tail.lower()
         logger.error(
             "App %s backend exited immediately (rc=%s) on port %d%s — %s",
-            app_name, proc.returncode, port,
+            app_name,
+            proc.returncode,
+            port,
             " [PORT COLLISION]" if collided else "",
             tail or "(no output)",
         )
@@ -1305,8 +1549,10 @@ def stop_app_backend(app_name: str) -> bool:
     if ap.proc and ap.proc.poll() is None:
         try:
             sel().log_api_access(
-                caller="gateway", operation="app_backend_stop",
-                outcome="sigterm", resources=f"{app_name} pid={ap.proc.pid}",
+                caller="gateway",
+                operation="app_backend_stop",
+                outcome="sigterm",
+                resources=f"{app_name} pid={ap.proc.pid}",
             )
         except Exception as exc:
             logger.debug("SEL audit failed for app_backend_stop %s: %s", app_name, exc)
@@ -1324,7 +1570,8 @@ def stop_app_backend(app_name: str) -> bool:
                 pass
             try:
                 sel().log_api_access(
-                    caller="gateway", operation="app_backend_stop",
+                    caller="gateway",
+                    operation="app_backend_stop",
                     outcome="sigkill_escalation",
                     resources=f"{app_name} pid={ap.proc.pid}",
                 )
@@ -1336,11 +1583,13 @@ def stop_app_backend(app_name: str) -> bool:
             logger.warning(
                 "Cannot stop adopted backend for %s on port %s: no recorded PIDs — "
                 "refusing to kill unknown processes",
-                app_name, ap.port,
+                app_name,
+                ap.port,
             )
             try:
                 sel().log_api_access(
-                    caller="gateway", operation="app_backend_stop_adopted",
+                    caller="gateway",
+                    operation="app_backend_stop_adopted",
                     outcome="rejected_no_pids",
                     resources=f"{app_name} port={ap.port}",
                 )
@@ -1376,7 +1625,9 @@ def stop_app_backend(app_name: str) -> bool:
                     "Adopted backend for %s on port %s: skipping live PIDs %s — "
                     "start-time identity does not match the adoption record "
                     "(recycled PID or unreadable identity); not signalling them",
-                    app_name, ap.port, unconfirmed,
+                    app_name,
+                    ap.port,
+                    unconfirmed,
                 )
 
             pids: list[int] = []
@@ -1400,7 +1651,8 @@ def stop_app_backend(app_name: str) -> bool:
                         logger.info(
                             "Adopted backend for %s: pid %d exited before the "
                             "pinned SIGTERM — nothing to signal",
-                            app_name, pid,
+                            app_name,
+                            pid,
                         )
                         continue
                     pids.append(pid)
@@ -1408,7 +1660,8 @@ def stop_app_backend(app_name: str) -> bool:
                     pass
             try:
                 sel().log_api_access(
-                    caller="gateway", operation="app_backend_stop_adopted",
+                    caller="gateway",
+                    operation="app_backend_stop_adopted",
                     outcome="sigterm",
                     resources=f"{app_name} port={ap.port} pids={pids}",
                 )
@@ -1445,16 +1698,21 @@ def stop_app_backend(app_name: str) -> bool:
             if escalated:
                 try:
                     sel().log_api_access(
-                        caller="gateway", operation="app_backend_stop_adopted",
+                        caller="gateway",
+                        operation="app_backend_stop_adopted",
                         outcome="sigkill_escalation",
                         resources=f"{app_name} port={ap.port} pids={escalated}",
                     )
                 except Exception as exc:
-                    logger.debug("SEL log_api_access failed for app_backend_stop_adopted sigkill: %s", exc)
+                    logger.debug(
+                        "SEL log_api_access failed for app_backend_stop_adopted sigkill: %s", exc
+                    )
         except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
             logger.warning(
                 "Failed to stop adopted backend for %s on port %s: %s",
-                app_name, ap.port, exc,
+                app_name,
+                ap.port,
+                exc,
             )
             # Restore tracking so a retry is possible
             with _lock:
@@ -1562,6 +1820,7 @@ def unstopped_backend_port(app_name: str, *, port_hint: int | None = None) -> in
 # Health checking
 # ---------------------------------------------------------------------------
 
+
 def health_reconcile_lock() -> Any:
     """The serialization every writer of an app's MCP + agent state must hold.
 
@@ -1601,14 +1860,14 @@ def _gate_mcp_registration(app_name: str, port: int, *, healthy: bool) -> bool:
             # letting `mcp_healthy` advance on it would strand the app's agent without
             # its MCP tools, with nothing left to retry.
             register_io_failures: list[str] = []
-            reregister_app_mcp_servers(
-                app_name, live_port=port, io_failures=register_io_failures
-            )
+            reregister_app_mcp_servers(app_name, live_port=port, io_failures=register_io_failures)
             if register_io_failures:
                 logger.warning(
                     "App %s: %d agent(s) could not be rewritten after MCP registration "
                     "(%s); reporting the reconcile unlanded so the watch retries",
-                    app_name, len(register_io_failures), ", ".join(register_io_failures),
+                    app_name,
+                    len(register_io_failures),
+                    ", ".join(register_io_failures),
                 )
                 return False
         else:
@@ -1627,13 +1886,15 @@ def _gate_mcp_registration(app_name: str, port: int, *, healthy: bool) -> bool:
                 logger.warning(
                     "App %s: the scrub could not be completed (%s); reporting it "
                     "unlanded so the watch retries",
-                    app_name, "; ".join(scrub_unreconciled),
+                    app_name,
+                    "; ".join(scrub_unreconciled),
                 )
                 return False
             if kept:
                 logger.info(
                     "App %s: kept %d backend-independent MCP server(s) after the scrub",
-                    app_name, len(kept),
+                    app_name,
+                    len(kept),
                 )
             # The scrub is only half the removal: an app's materialized agent JSONs COPY
             # the server's launch spec, and the agent config is what kiro-cli loads. So
@@ -1683,7 +1944,9 @@ def _gate_mcp_registration(app_name: str, port: int, *, healthy: bool) -> bool:
                 logger.warning(
                     "App %s: %d agent(s) could not be rewritten after the MCP scrub (%s); "
                     "reporting the reconcile unlanded so the watch retries",
-                    app_name, len(scrub_io_failures), ", ".join(scrub_io_failures),
+                    app_name,
+                    len(scrub_io_failures),
+                    ", ".join(scrub_io_failures),
                 )
                 return False
         return True
@@ -1777,13 +2040,16 @@ def _health_check_loop(ap: AppProcess, health_path: str) -> AppProcess | None:
                 return None
             logger.info(
                 "App %s backend healthy (port %d, attempt %d)",
-                app_name, port, attempt + 1,
+                app_name,
+                port,
+                attempt + 1,
             )
             return ap
 
     logger.warning(
         "App %s backend failed health check after %d attempts",
-        app_name, _HEALTH_CHECK_RETRIES,
+        app_name,
+        _HEALTH_CHECK_RETRIES,
     )
     # Backend never became healthy: scrub any optimistic/stale MCP entry so kiro-cli does
     # not keep dialing a dead port on every session (the reverted-outage shape).
@@ -1810,13 +2076,17 @@ def _rebind_adopted_owners(ap: AppProcess, health_path: str) -> bool:
     except Exception as exc:  # noqa: BLE001 — the watch must never die on a probe
         logger.warning(
             "App %s: could not re-capture adopted owners on port %d: %s",
-            ap.app_name, ap.port, exc,
+            ap.app_name,
+            ap.port,
+            exc,
         )
         return False
     if captured is None:
         logger.warning(
             "App %s: adopted backend on port %d answered again but its ownership could "
-            "not be confirmed — leaving it unhealthy", ap.app_name, ap.port,
+            "not be confirmed — leaving it unhealthy",
+            ap.app_name,
+            ap.port,
         )
         return False
     pids, start_times = captured
@@ -1846,7 +2116,9 @@ def _watch_backend_health(ap: AppProcess, health_path: str) -> None:
         except Exception:  # noqa: BLE001 — see the docstring; a dying watch is the bug
             logger.warning(
                 "App %s: health watch sweep failed on port %d; restarting the watch",
-                ap.app_name, ap.port, exc_info=True,
+                ap.app_name,
+                ap.port,
+                exc_info=True,
             )
             with _lock:
                 if _processes.get(ap.app_name) is not ap:
@@ -1970,7 +2242,9 @@ def _app_enabled_state(app_name: str) -> bool | None:
         return app_enabled_state(app_name)
     except Exception as exc:  # noqa: BLE001 — unknown is a state, not a crash
         logger.warning(
-            "App %s: could not read its enabled state: %s", app_name, exc,
+            "App %s: could not read its enabled state: %s",
+            app_name,
+            exc,
         )
         return None
 
@@ -1995,7 +2269,8 @@ def _drop_disabled_app_resources(app_name: str) -> bool:
     if errors:
         logger.warning(
             "App %s: dropping a disabled app's resources did not complete (%s)",
-            app_name, "; ".join(errors),
+            app_name,
+            "; ".join(errors),
         )
         return False
     return True
@@ -2026,7 +2301,8 @@ def _undo_promotion_of_disabled_app(ap: AppProcess) -> bool:
     if not _drop_disabled_app_resources(ap.app_name):
         logger.warning(
             "App %s: undoing the registration of a now-disabled app did not complete; "
-            "retrying on the next sweep", ap.app_name,
+            "retrying on the next sweep",
+            ap.app_name,
         )
         return False
     with _lock:
@@ -2034,7 +2310,8 @@ def _undo_promotion_of_disabled_app(ap: AppProcess) -> bool:
             ap.mcp_healthy = False
     logger.warning(
         "App %s was disabled while its recovery was being registered; the registration "
-        "has been undone", ap.app_name,
+        "has been undone",
+        ap.app_name,
     )
     return True
 
@@ -2120,7 +2397,10 @@ def _demote(ap: AppProcess, *, reason: str) -> None:
     """Mark a backend unhealthy and scrub its MCP entry. Reversible — see _promote."""
     if _set_backend_health(ap, healthy=False):
         logger.warning(
-            "App %s backend went unhealthy on port %d — %s", ap.app_name, ap.port, reason,
+            "App %s backend went unhealthy on port %d — %s",
+            ap.app_name,
+            ap.port,
+            reason,
         )
 
 
@@ -2139,7 +2419,9 @@ def _retry_mcp_reconcile(ap: AppProcess, *, healthy: bool) -> None:
     if _set_backend_health(ap, healthy=healthy):
         logger.debug(
             "App %s: retried MCP reconcile (healthy=%s) on port %d",
-            ap.app_name, healthy, ap.port,
+            ap.app_name,
+            healthy,
+            ap.port,
         )
 
 
@@ -2354,7 +2636,8 @@ def _reap_stale_app_backends() -> int:
             # ``handled``) so a future start can retry once ps recovers.
             logger.info(
                 "Skipping stale-reap of %s pid %d: start_time unconfirmed (recycled or unreadable)",
-                app_name, pid,
+                app_name,
+                pid,
             )
             continue
         try:
@@ -2374,7 +2657,8 @@ def _reap_stale_app_backends() -> int:
         if not signalled:
             logger.info(
                 "Skipping stale-reap of %s pid %d: identity could not be pinned for the kill",
-                app_name, pid,
+                app_name,
+                pid,
             )
             continue
         handled[app_name] = entry
@@ -2383,8 +2667,10 @@ def _reap_stale_app_backends() -> int:
         reaped.append((app_name, pid, recorded_st))
         try:
             sel().log_api_access(
-                caller="gateway", operation="app_backend_stale_reap",
-                outcome="sigterm", resources=f"{app_name} pid={pid}",
+                caller="gateway",
+                operation="app_backend_stale_reap",
+                outcome="sigterm",
+                resources=f"{app_name} pid={pid}",
             )
         except Exception as exc:
             logger.debug("SEL audit failed for app_backend_stale_reap %s: %s", app_name, exc)
@@ -2407,7 +2693,8 @@ def _reap_stale_app_backends() -> int:
         if _proc_start_time(pid) != recorded_st:
             logger.info(
                 "Skipping stale-reap SIGKILL of %s pid %d: start_time changed (PID recycled)",
-                app_name, pid,
+                app_name,
+                pid,
             )
             continue
         try:
@@ -2419,18 +2706,23 @@ def _reap_stale_app_backends() -> int:
             ):
                 logger.info(
                     "Skipping stale-reap SIGKILL of %s pid %d: identity could not be pinned",
-                    app_name, pid,
+                    app_name,
+                    pid,
                 )
                 continue
         except (ProcessLookupError, OSError):
             continue
         try:
             sel().log_api_access(
-                caller="gateway", operation="app_backend_stale_reap",
-                outcome="sigkill", resources=f"{app_name} pid={pid}",
+                caller="gateway",
+                operation="app_backend_stale_reap",
+                outcome="sigkill",
+                resources=f"{app_name} pid={pid}",
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("SEL audit failed for app_backend_stale_reap sigkill %s: %s", app_name, exc)
+            logger.debug(
+                "SEL audit failed for app_backend_stale_reap sigkill %s: %s", app_name, exc
+            )
     # Drop only the entries we handled, re-reading under the lock so a concurrent
     # enable/disable that wrote during the scan is merged, not clobbered. Drop an
     # entry ONLY if it still equals what we handled: a mid-scan re-record (new
@@ -2483,7 +2775,8 @@ def start_enabled_app_backends() -> list[str]:
             if removed:
                 logger.info(
                     "Boot reconcile: scrubbed %d stale MCP server(s) for disabled app %s",
-                    removed, name,
+                    removed,
+                    name,
                 )
         except Exception as exc:  # noqa: BLE001 — boot must never crash on reconcile
             logger.warning("Boot MCP reconcile failed for disabled app %s: %s", name, exc)
@@ -2539,8 +2832,7 @@ def start_enabled_app_backends() -> list[str]:
                 _deregister_mcp_servers(name)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
-                    "Boot resource reconcile: FAILED to revoke resources for "
-                    "denied app %s: %s",
+                    "Boot resource reconcile: FAILED to revoke resources for " "denied app %s: %s",
                     name,
                     exc,
                 )
@@ -2593,9 +2885,7 @@ def start_enabled_app_backends() -> list[str]:
         # — otherwise a require_signature policy would strand every core app.
         if app_info.get("origin") != "builtin":
             try:
-                denied = app_admission_denied(
-                    name, manifest=get_app_manifest(name), action="boot"
-                )
+                denied = app_admission_denied(name, manifest=get_app_manifest(name), action="boot")
             except Exception as exc:  # noqa: BLE001 — boot must never crash on re-vet
                 # Fail CLOSED: if the re-vet itself errors (transient I/O, a bug
                 # in the admission logic), treat the app as denied rather than
@@ -2605,18 +2895,23 @@ def start_enabled_app_backends() -> list[str]:
                 logger.error(
                     "Boot admission re-vet failed for app %s: %s — treating as denied "
                     "(fail-closed)",
-                    name, exc,
+                    name,
+                    exc,
                 )
                 denied = f"admission re-vet error: {exc}"
             if denied:
                 logger.warning(
                     "Boot: skipping enabled app %s — blocked by admission policy: %s",
-                    name, denied,
+                    name,
+                    denied,
                 )
                 try:
                     sel().log_api_access(
-                        caller="gateway", operation="app_backend_boot",
-                        outcome="denied", resources=name, error=denied,
+                        caller="gateway",
+                        operation="app_backend_boot",
+                        outcome="denied",
+                        resources=name,
+                        error=denied,
                     )
                 except Exception as exc:
                     logger.debug("SEL audit failed for app %s boot deny: %s", name, exc)
@@ -2699,12 +2994,16 @@ def _start_backends_concurrently(names: list[str]) -> list[str]:
                 logger.error(
                     "Boot: failed to start backend for app %s: %s — skipping "
                     "(gateway continues)",
-                    name, exc,
+                    name,
+                    exc,
                 )
                 try:
                     sel().log_api_access(
-                        caller="gateway", operation="app_backend_boot",
-                        outcome="error", resources=name, error=str(exc),
+                        caller="gateway",
+                        operation="app_backend_boot",
+                        outcome="error",
+                        resources=name,
+                        error=str(exc),
                     )
                 except Exception as sel_exc:
                     logger.debug("SEL audit failed for app %s boot error: %s", name, sel_exc)

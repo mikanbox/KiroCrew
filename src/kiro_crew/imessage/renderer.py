@@ -29,7 +29,11 @@ from kiro_crew.imessage.rpc import RpcError, RpcTransportError
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.renderer import Renderer, render_options_as_text
 from kiro_crew.messaging.transport import TransportCapabilities
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 
 if TYPE_CHECKING:
     from kiro_crew.imessage.client import IMessageClient
@@ -42,6 +46,30 @@ logger = logging.getLogger(__name__)
 _TYPING_THROTTLE_S = 4.0
 
 _ERROR_TEXT = "⚠️ Something went wrong — please try again."
+
+
+def _credential_redaction_warning(count: int) -> str:
+    """Plaintext notice for a delivered answer that had credentials removed.
+
+    ``count`` is the number of redaction placeholders in the text that actually
+    shipped, so the wording matches what the reader sees above. The notice
+    carries no secret bytes: by the time it is built, a tag has already replaced
+    them.
+
+    iMessage renders no markup and a sent message cannot be edited, so this is a
+    plain sentence sent as a SEPARATE follow-up message. The blunt second clause
+    is the point: a redacted command is not a working command, which is the
+    failure issue #8123 (and #6189) reports -- the reader pastes it and meets an
+    opaque error far from the real cause.
+    """
+    subject = "A credential" if count == 1 else f"{count} credentials"
+    verb = "was" if count == 1 else "were"
+    return (
+        f"Security notice: {subject} in the previous message {verb} replaced "
+        "with a redaction placeholder. Any command shown will not work if you "
+        "paste it as-is; supply the secret yourself on the machine where you "
+        "run it."
+    )
 
 
 def _default_redactor(text: str) -> str:
@@ -156,6 +184,35 @@ class IMessageRenderer(Renderer):
                     exc,
                 )
                 raise
+
+        # The answer shipped. If credential redaction rewrote it, the reader is
+        # holding a command that will not run when pasted and -- unlike the
+        # dashboard, which appends a notice row -- iMessage cannot edit a sent
+        # message, so the only way to say so is an ADDITIONAL follow-up message
+        # (issue #8123). This was silent before: `_default_redactor` discards the
+        # warnings list, so the placeholder shipped with nothing explaining it.
+        #
+        # Count from the TAG in the delivered text, summing every tag the
+        # redactor can emit (`CREDENTIAL_REDACTION_TAGS`) rather than one, so an
+        # encoded-credential-only answer is not silently missed.
+        #
+        # Best-effort AFTER the answer succeeded: a failure to deliver the notice
+        # must NOT re-raise and convert an already-delivered answer into a failed
+        # turn. That trade is deliberate -- the answer is out; losing the notice
+        # is a degraded warning, losing the turn would discard a delivered reply.
+        _cred_redactions = sum(content.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+        if _cred_redactions > 0:
+            try:
+                await self._client.send(
+                    self._handle, _credential_redaction_warning(_cred_redactions)
+                )
+            except (RpcError, RpcTransportError) as exc:
+                logger.warning(
+                    "imessage: could not deliver the redaction notice to %s "
+                    "(answer already sent): %s",
+                    redact_handle(self._handle),
+                    exc,
+                )
 
     async def close(self) -> None:
         """Idempotent teardown: finalize the turn if it never reached on_done.

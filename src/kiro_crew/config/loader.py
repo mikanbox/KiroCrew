@@ -1121,14 +1121,30 @@ def update_config_locked(
 ) -> dict:
     """Perform an atomic read-modify-write of a config file under an advisory lock.
 
-    The locked primitive for the converted config.json writers and the required
-    path for new config.json mutations.  Legacy writers that pre-date this
-    function (dashboard agents endpoint, updates.py, security.py,
-    messaging.py, mcp.py, core.py STT) still use
-    :func:`write_config_atomically` directly and rely on the in-process asyncio
-    ``_get_config_lock()`` only.  ``memory.py`` was in that list and has been
-    converted; it now reaches this function through
-    ``dashboard/chat_utils.run_config_write``.
+    The locked primitive for every ``config.json`` writer that calls
+    :func:`write_config_atomically`, and the required path for new
+    ``config.json`` mutations.  **No direct
+    ``write_config_atomically(config_path())`` caller remains outside this
+    module** -- the dashboard agents endpoint, ``security.py``, the apps
+    manager and the CLI setup wizard were the last of them and are converted
+    (#8032); ``memory.py`` was converted earlier and reaches this function
+    through ``dashboard/chat_utils.run_config_write``.
+    ``TestEveryConfigWriterIsLocked`` in
+    ``test/test_config_rmw_preserves_settings.py`` is the ratchet that keeps the
+    list from regrowing.
+
+    A SECOND family of writers still bypasses this lock, and it is not reached
+    by that ratchet because it does not call
+    :func:`write_config_atomically` at all: handlers that write
+    ``config_path()`` through ``kiro_crew.agent._atomic_json_write``
+    (``messaging.py``'s per-channel savers, ``core.py``'s STT PUT,
+    ``mcp.py``'s gateway-enable) or through
+    :meth:`KiroCrewConfig.save` (``updates.py``'s log-level PUT,
+    ``core.py``'s theme PUT, several ``agents.py`` agent CRUD endpoints).
+    Those rely on the in-process asyncio ``_get_config_lock()`` only, which
+    serializes same-loop callers and nothing else, so they can still interleave
+    with a holder of this lock.  Converting them is follow-up work; do not read
+    the ratchet's green as covering them.
 
     Contract:
 

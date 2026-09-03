@@ -54,10 +54,10 @@ from kiro_crew.config.loader import (
     coerce_effort,
     inject_kiro_cli_api_key,
     normalize_agent_model,
-    read_config_for_update,
     resolve_agent_bindings,
     resolve_agent_config_path,
     resolve_effective_model,
+    update_config_locked,
     write_config_atomically,
 )
 from kiro_crew.config.schema import SCHEMA_REGISTRY, config_entry_to_dict
@@ -932,17 +932,29 @@ def _commit_agent_config_locked(
             ", ".join(preserved),
         )
     sanitize(config)
-    # (1) The one fallible READ, and it precedes every write.
+
+    # (1)+(2) config.json, read AND written inside one hold of the
+    # ``<config>.json.lock`` sidecar. The caller's ``_get_config_lock()`` is an
+    # asyncio lock: it serializes this against sibling handlers on this event
+    # loop and nothing else. The ~69 ``update_config_locked`` writers -- the CLI,
+    # the boot refresh, another gateway process -- take the advisory lock
+    # instead, so without this the two families could interleave and whichever
+    # renamed second published a document that never saw the other's change.
     #
-    # Fail closed: writing back a {} baseline would drop every other setting
-    # just to record removedTools (see read_config_for_update).
-    mc_cfg = read_config_for_update(mc_cfg_path)
-    if removed_per_key:
-        mc_cfg["removedTools"] = removed_per_key
-    else:
-        mc_cfg.pop("removedTools", None)
-    # (2) config.json — the snapshot the read above produced, still current.
-    write_config_atomically(mc_cfg_path, mc_cfg)
+    # Still the one fallible READ, and it still precedes every write: with the
+    # default ``on_corrupt="fail"`` an unreadable config raises
+    # :class:`ConfigReadError` out of here before anything durable happens, so
+    # the caller's 500 stays exact. Failing closed is the point -- writing back a
+    # {} baseline would drop every other setting just to record removedTools
+    # (see read_config_for_update).
+    def _record_removed_tools(mc_cfg: dict) -> dict:
+        if removed_per_key:
+            mc_cfg["removedTools"] = removed_per_key
+        else:
+            mc_cfg.pop("removedTools", None)
+        return mc_cfg
+
+    update_config_locked(mc_cfg_path, mutate=_record_removed_tools, stamp_meta=False)
     # (3) agent_model_state.json bookkeeping — after (2), before (4).
     changed = agent_state.lift_and_strip_bookkeeping(config, name)
     # (4) the installed spec, under the caller's bridge-file lock.
@@ -1247,24 +1259,40 @@ async def api_default_agent(request: web.Request) -> web.Response:
         # can capture a baseline the worker is about to republish — and the last
         # atomic rename silently reverts the other side's unrelated settings.
         #
-        # Loop-side ``async with`` rather than an offload: the lock is an
-        # asyncio lock (``LoopBoundLock``) acquired exactly this way by every
-        # sibling RMW in this module, and the read and write below are
-        # synchronous with NO await between them, so once the lock is held the
-        # pair is already indivisible — a worker hop would add a cancellation
-        # point where today there is none.
+        # That lock is not sufficient on its own, though: it is an asyncio lock,
+        # so it serializes only same-loop callers. The read-modify-write itself
+        # goes through ``update_config_locked``, which holds the
+        # ``<config>.json.lock`` sidecar across its own read and write and so
+        # also serializes against the CLI, worker threads and other processes.
+        #
+        # Offloaded through the shielded ``_offload_config_write`` because the
+        # advisory acquire can WAIT: an unbounded flock wait on the event loop
+        # would stall the gateway. The shield is what keeps the pair indivisible
+        # across the worker hop -- it re-absorbs cancellations until the thread
+        # is done, so ``async with`` cannot release the lock with a write still
+        # in flight. Same shape as the agent-config PUT and the MCP stub write.
+        from kiro_crew.dashboard.handlers.mcp import _offload_config_write
+
+        def _set_default(data: dict) -> dict:
+            data["default_agent"] = name
+            return data
+
         async with _get_config_lock():
             try:
-                data = read_config_for_update(path)
+                await _offload_config_write(
+                    update_config_locked,
+                    path,
+                    mutate=_set_default,
+                    stamp_meta=False,
+                )
             except ConfigReadError:
-                # Fail closed: writing back a {} baseline would drop every other setting.
+                # Fail closed: writing back a {} baseline would drop every other
+                # setting. Nothing durable ran, so this 500 is exact.
                 logger.exception("Refusing to set default agent: config unreadable")
                 return web.json_response(
                     {"error": "failed to read config file", "code": "config_unreadable"},
                     status=500,
                 )
-            data["default_agent"] = name
-            write_config_atomically(path, data)
         return web.json_response({"ok": True, "default_agent": name})
     cfg = KiroCrewConfig.load()
     return web.json_response({"default_agent": cfg.default_agent})

@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from kiro_crew.cron import CronJob
-from kiro_crew.dashboard.cron_inject import inject_cron_result_to_dashboard, run_marker
+from kiro_crew.dashboard.cron_inject import (
+    _UNCHANGED_PROMPT_BODY,
+    inject_cron_result_to_dashboard,
+    run_marker,
+)
 from kiro_crew.session_surface import set_dashboard_surfaced
 
 
@@ -78,11 +82,17 @@ def _make_job(
     message="do the thing",
     last_result_ts=0.0,
     timezone="UTC",
+    prompt_changed=True,
 ):
     # ``message``, ``last_result_ts``, ``last_result_stamp`` and ``timezone``
     # are real values, not Mock attributes: the injector writes the run's prompt
     # as a paired ``user`` row and reads the rendered stamp, so a MagicMock here
     # would reach the redactors as a non-string.
+    #
+    # ``prompt_changed`` for a sharper reason: it is read as a BOOLEAN, and a
+    # MagicMock attribute is truthy, so leaving it unset would make every test
+    # here take the verbatim branch no matter what the injector decided —
+    # silently unable to fail. Defaults True because that is a first run.
     job = MagicMock()
     job.id = job_id
     job.name = name
@@ -93,6 +103,7 @@ def _make_job(
     # Rendered by the PRODUCTION renderer rather than hand-written, so the fake
     # cannot drift from the spelling the executor actually persists.
     job.last_result_stamp = CronJob._render_run_stamp(job, last_result_ts)
+    job.prompt_changed = prompt_changed
     job.agent_id = ""
     return job
 
@@ -110,6 +121,15 @@ def _inject(state, job, result_text, **kw):
         state.conversation_log.read_messages(f"cron:{job.id}") if state.conversation_log else [],
     )
     inject_cron_result_to_dashboard(state, job, result_text, **kw)
+
+
+def run_marker_of(content: str) -> str:
+    """The ``<!-- cron-run:... -->`` marker inside a row, or ``""``."""
+    start = content.find("<!-- cron-run:")
+    if start == -1:
+        return ""
+    end = content.find("-->", start)
+    return content[start : end + 3] if end != -1 else ""
 
 
 class TestInjectCronResultToDashboard:
@@ -326,6 +346,206 @@ class TestInjectCronResultToDashboard:
         slot = state.get_or_create_slot(name=f"cron-{job.id}")
         assert [m["role"] for m in slot.messages] == ["assistant"]
         assert "the message as edited later" not in slot.messages[0]["content"]
+
+    def test_an_unchanged_prompt_is_referenced_not_repeated(self):
+        """Run two of a persistent cron must not store the instruction again.
+
+        The message of a persistent cron is one value for the job's whole life,
+        and each row carries a per-run marker so nothing dedups them. Storing it
+        verbatim every run spent the log's rotation window and the replay's
+        character budget on copies of an unchanged instruction, so the tab
+        retained FEWER distinct runs than before the prompt row existed.
+        """
+        state = _make_state(
+            history_messages=[
+                {"role": "user", "content": "# Cron Run: test-cron\n\nthe long instruction"},
+                {"role": "assistant", "content": "# Cron Job Result: test-cron\n\nrun one"},
+            ]
+        )
+        job = _make_job(
+            message="the long instruction",
+            prompt_changed=False,
+            last_result_ts=1_756_000_000.0,
+        )
+        _inject(state, job, "run two")
+
+        # The last two rows are this run's pair; anything before them is the
+        # hydrated transcript.
+        prompt_row = state._slots["cron-abc123"].messages[-2]
+        assert prompt_row["role"] == "user"
+        assert "the long instruction" not in prompt_row["content"]
+        assert _UNCHANGED_PROMPT_BODY in prompt_row["content"]
+
+    def test_a_referenced_run_still_carries_its_own_boundary(self):
+        """The placeholder row is still a run boundary.
+
+        Its body changes; its header does not. The stamp and the marker are what
+        separate one run from the next, so a referenced run must remain as
+        distinguishable as a verbatim one — otherwise suppressing the repeat
+        would undo the fix it is part of.
+        """
+        state = _make_state(
+            history_messages=[
+                {"role": "user", "content": "# Cron Run: test-cron\n\ndo the thing"},
+            ]
+        )
+        job = _make_job(prompt_changed=False, last_result_ts=1_756_000_000.0)
+        _inject(state, job, "run two")
+
+        prompt_row = state._slots["cron-abc123"].messages[-2]["content"]
+        assert job.last_result_stamp in prompt_row
+        assert f"<!-- cron-run:abc123:{1_756_000_000.0:.6f} -->" in prompt_row
+
+    def test_an_edited_prompt_is_written_verbatim_again(self):
+        """A message edited on a live job puts the NEW text in the transcript."""
+        state = _make_state(
+            history_messages=[
+                {"role": "user", "content": "# Cron Run: test-cron\n\nthe old instruction"},
+            ]
+        )
+        job = _make_job(message="the new instruction", prompt_changed=True)
+        _inject(state, job, "a result")
+
+        prompt_row = state._slots["cron-abc123"].messages[-2]["content"]
+        assert "the new instruction" in prompt_row
+        assert _UNCHANGED_PROMPT_BODY not in prompt_row
+
+    def test_the_prompt_is_rewritten_when_no_copy_survives(self):
+        """The placeholder points ABOVE itself, so a copy must exist up there.
+
+        The log rotates (10MB / ~200 lines), so the last verbatim row is
+        eventually evicted. Re-writing the instruction when none survives keeps
+        the reference resolvable instead of dangling.
+        """
+        state = _make_state(history_messages=[])
+        job = _make_job(message="the long instruction", prompt_changed=False)
+        _inject(state, job, "a result")
+
+        prompt_row = state._slots["cron-abc123"].messages[-2]["content"]
+        assert "the long instruction" in prompt_row
+        assert _UNCHANGED_PROMPT_BODY not in prompt_row
+
+    def test_a_result_row_is_not_mistaken_for_a_prompt_copy(self):
+        """``# Cron Job Result:`` must not satisfy the ``# Cron Run:`` scan.
+
+        The two headers are adjacent in spelling, and treating a result row as a
+        surviving prompt copy would leave the placeholder pointing at output
+        rather than at an instruction.
+        """
+        state = _make_state(
+            history_messages=[
+                {"role": "assistant", "content": "# Cron Job Result: test-cron\n\nrun one"},
+            ]
+        )
+        job = _make_job(message="the long instruction", prompt_changed=False)
+        _inject(state, job, "run two")
+
+        prompt_row = state._slots["cron-abc123"].messages[-2]["content"]
+        assert "the long instruction" in prompt_row
+
+    def test_three_runs_of_one_persistent_cron_read_as_three_runs(self):
+        """End-to-end: the tab a user opens after three runs.
+
+        Every other test here pins ONE run's decision. What a user actually
+        reads is the accumulated transcript, and its shape is the whole point of
+        the change: three distinguishable runs, the instruction stored ONCE.
+
+        Driven through a real ``CronJob`` rather than the fake, so the
+        fingerprint comparison in ``set_run_result`` is the one under test, and
+        each run's rows are fed back as the next run's history the way the
+        gateway re-reads the transcript per run.
+        """
+        message = "Check the on-call dashboard.\nSummarize any new pages."
+        result = "No new pages since the last check."
+        job = CronJob(id="abc123", name="oncall", message=message, timezone="UTC")
+
+        state = _make_state()
+        for i, ts in enumerate((1_756_000_000.0, 1_756_086_400.0, 1_756_172_800.0)):
+            job.set_run_result(result)
+            # Pin the epoch so the stamps and markers are deterministic; the
+            # renderer stays the production one.
+            job.last_result_ts = ts
+            job.last_result_stamp = job._render_run_stamp(ts)
+            # Production's own shape: prefetch_cron_history reads the transcript
+            # only for an UNLINKED slot and returns None once it is linked, so
+            # every run after the first passes None. Feeding a list here instead
+            # would hide a decision that reads the parameter rather than the slot.
+            _inject(state, job, result, history=[] if i == 0 else None)
+
+        rows = state._slots["cron-abc123"].messages
+        assert [r["role"] for r in rows] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ], "three runs, each a prompt/result pair"
+
+        prompts = [r["content"] for r in rows if r["role"] == "user"]
+        # The instruction is stored ONCE across the three runs -- the defect this
+        # change fixes was storing it three times.
+        assert sum(message in p for p in prompts) == 1
+        assert prompts[0].endswith(message)
+        assert all(_UNCHANGED_PROMPT_BODY in p for p in prompts[1:])
+
+        # And the runs stay distinguishable, which is what the repeat suppression
+        # must not cost: every row carries its own run's marker.
+        markers = [run_marker_of(r["content"]) for r in rows]
+        assert len(set(markers)) == 3, "one distinct marker per run"
+        assert all(markers), "no row may lose its identity marker"
+
+    def test_a_repeat_is_suppressed_even_though_history_is_none(self):
+        """The steady state passes ``history=None``, and must still suppress.
+
+        ``prefetch_cron_history`` reads the transcript only to hydrate an
+        UNLINKED slot and returns ``None`` once the slot is linked -- which is
+        every run of a persistent cron after the first. A decision that consulted
+        the parameter would therefore see nothing exactly when it matters and
+        write the instruction verbatim on every run, making the suppression a
+        no-op in production while still passing a test that hand-fed a list.
+        """
+        message = "the long instruction"
+        job = CronJob(id="abc123", name="oncall", message=message, timezone="UTC")
+        state = _make_state()
+
+        job.set_run_result("run one")
+        _inject(state, job, "run one", history=[])
+        job.set_run_result("run two")
+        _inject(state, job, "run two", history=None)
+
+        prompts = [
+            r["content"] for r in state._slots["cron-abc123"].messages if r["role"] == "user"
+        ]
+        assert len(prompts) == 2
+        assert sum(message in p for p in prompts) == 1, "stored once, not once per run"
+        assert _UNCHANGED_PROMPT_BODY in prompts[1]
+
+    def test_a_placeholder_is_not_a_surviving_copy_of_the_prompt(self):
+        """A reference must not resolve to another reference.
+
+        The placeholder shares the ``# Cron Run:`` header on purpose -- it is
+        still a run boundary -- so a prefix test alone answers "is there a prompt
+        row", not "is the instruction still here". Once rotation has evicted the
+        verbatim row, counting a placeholder as a surviving copy would leave a run
+        whose instruction is recoverable from nothing.
+        """
+        state = _make_state(
+            history_messages=[
+                {
+                    "role": "user",
+                    "content": f"# Cron Run: test-cron\n\n{_UNCHANGED_PROMPT_BODY}",
+                },
+                {"role": "assistant", "content": "# Cron Job Result: test-cron\n\nrun nine"},
+            ]
+        )
+        job = _make_job(message="the long instruction", prompt_changed=False)
+        _inject(state, job, "run ten")
+
+        prompt_row = state._slots["cron-abc123"].messages[-2]["content"]
+        assert (
+            "the long instruction" in prompt_row
+        ), "a placeholder-only window must trigger a fresh verbatim copy"
 
     def test_the_pair_is_persisted_as_one_grouped_write(self):
         """Both rows reach the durable log in a single ordered call.

@@ -403,6 +403,27 @@ class TestControlFrames:
         await _handle(_ScriptedReader(_register_frame(stub_uuid="")), writer, _fake_pool())
         assert writer.frames() == [{"type": "rejected", "reason": "missing stub_uuid"}]
 
+    @pytest.mark.asyncio
+    async def test_register_naming_a_reserved_stub_prefix_is_rejected(self, peer_ok):
+        """`Backend` exempts an internally-prefixed stub uuid from the MCP Apps
+        render path AND the model-visibility filter, so a stub that merely NAMES
+        itself with the prefix would inherit both exemptions and be served tools
+        the model is meant not to see. The prefix is the gateway's own; refuse it
+        at registration."""
+        from kiro_crew.mcp_gateway.backend import INTERNAL_STUB_PREFIXES
+
+        assert INTERNAL_STUB_PREFIXES  # a silently empty tuple would pass vacuously
+        for prefix in INTERNAL_STUB_PREFIXES:
+            writer = _FakeWriter()
+            await _handle(
+                _ScriptedReader(_register_frame(stub_uuid=f"{prefix}deadbeef")),
+                writer,
+                _fake_pool(),
+            )
+            assert writer.frames() == [
+                {"type": "rejected", "reason": "reserved stub_uuid prefix"}
+            ], prefix
+
 
 # --- registration bookkeeping ------------------------------------------------
 

@@ -168,6 +168,7 @@ from kiro_crew.heartbeat import (
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_dict
+from kiro_crew.kiro_cli import resolve_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
@@ -9671,12 +9672,30 @@ class GatewayOrchestrator:
             logger.info("Auto-update: reset to origin/%s, rebuilding", branch)
 
             # Update the optional kiro-cli backend if present.
-            if shutil.which("kiro-cli"):
+            #
+            # Resolved to an ABSOLUTE path, and the resolved path is what is
+            # exec'd. A bare `"kiro-cli"` argv0 is re-resolved off `PATH` by the
+            # exec itself, and a gateway's `PATH` can lead with an
+            # agent-writable directory (a worktree venv's `bin`,
+            # `~/.local/bin`) — so on this unattended path a planted shim would
+            # run with the gateway's environment. `resolve_kiro_cli` is the same
+            # resolver the ACP client uses to spawn kiro-cli for every session,
+            # so this updates exactly the binary that actually runs and grants
+            # no trust the session path does not already grant. `None` means
+            # "no kiro-cli" — skip the step, as the `shutil.which` guard did.
+            _kiro_bin = resolve_kiro_cli()
+            if _kiro_bin:
                 kiro_update: asyncio.subprocess.Process | None = None
                 try:
                     kiro_update = await asyncio.create_subprocess_exec(
-                        "kiro-cli",
+                        _kiro_bin,
                         "update",
+                        # Explicit env rather than inheriting: `_git_env` is
+                        # `os.environ` with the git location variables STRIPPED
+                        # and the exec-vector pins applied, so any git this
+                        # child spawns of its own carries the same pins the
+                        # sibling spawns above rely on.
+                        env=_git_env,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                         # Own process group (POSIX; no-op on Windows) so the

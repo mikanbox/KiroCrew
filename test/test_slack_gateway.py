@@ -3497,7 +3497,9 @@ class TestAutoApplyUpdateVenvPath:
 
         async def _fake_exec(*args, **kwargs):
             argv = [a for a in args if isinstance(a, str)]
-            if argv and argv[0] == "kiro-cli":
+            # argv0 is the path the resolver returned, not a bare name: a bare
+            # name would be re-resolved off PATH by the exec itself.
+            if argv and argv[0] == "/usr/bin/kiro-cli":
                 proc = AsyncMock()
                 proc.kill = MagicMock()
                 proc.returncode = None
@@ -3530,9 +3532,11 @@ class TestAutoApplyUpdateVenvPath:
                                 new_callable=AsyncMock,
                             ) as mock_build:
                                 with patch("os.execv", side_effect=OSError("test")):
-                                    # Truthy: the optional kiro-cli step runs.
+                                    # A resolved path: the optional kiro-cli
+                                    # step runs.
                                     with patch(
-                                        "shutil.which", return_value="/usr/bin/kiro-cli"
+                                        "kiro_crew.slack.gateway.resolve_kiro_cli",
+                                        return_value="/usr/bin/kiro-cli",
                                     ):
                                         # The gateway resolves _kill_and_reap
                                         # function-locally on every call, so
@@ -8543,3 +8547,32 @@ class TestAutoApplyUpdatePreconditions:
 
         assert not any("fetch" in a for a in argvs), argvs
         assert not any("reset" in a for a in argvs), argvs
+
+
+# ─── Auto-update spawns resolve their binary off PATH ────────────────────────
+
+
+class TestAutoUpdateSpawnsArePinned:
+    def test_no_spawn_in_the_auto_update_path_names_a_bare_binary(self):
+        """`create_subprocess_exec` re-resolves a string argv0 through `PATH` at
+        exec time, and a gateway's `PATH` can lead with an agent-writable
+        directory (a worktree venv's `bin`, `~/.local/bin`). On THIS path what
+        the spawned program does decides which code is installed and
+        re-executed, so a planted shim would choose the payload -- and the path
+        is unattended, with no human to notice. Every spawn here therefore names
+        a value resolved beforehand (`trusted_git_bin`, `resolve_kiro_cli`,
+        `sys.executable`), never a literal.
+        """
+        spawns = [
+            node
+            for node in ast.walk(_gateway_method("_auto_apply_update"))
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "create_subprocess_exec"
+        ]
+        assert spawns, "found no spawns to check -- the guard would pass vacuously"
+        literal = [
+            (node.lineno, node.args[0].value)
+            for node in spawns
+            if node.args and isinstance(node.args[0], ast.Constant)
+        ]
+        assert literal == [], f"bare argv0 re-resolved off PATH at exec time: {literal}"

@@ -60,7 +60,12 @@ from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
 from kiro_crew.mcp_caller import new_tenant_nonce
 from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, tool_surface, transport
 from kiro_crew.mcp_gateway.apps import sweep_spool as apps_sweep_spool
-from kiro_crew.mcp_gateway.backend import Backend, BackendGone, spawn_backend
+from kiro_crew.mcp_gateway.backend import (
+    INTERNAL_STUB_PREFIXES,
+    Backend,
+    BackendGone,
+    spawn_backend,
+)
 from kiro_crew.mcp_gateway.backend_tmp import sweep_all_backend_tmp
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
 from kiro_crew.mcp_gateway.hashing import hash_effective_env, non_secret_env
@@ -2480,6 +2485,22 @@ async def _handle_connection(
             {"type": "rejected", "reason": "missing stub_uuid"},
         )
         logger.warning("rejected Register: missing stub_uuid")
+        return
+
+    # A reserved prefix is the gateway's OWN marker: `Backend` treats any stub
+    # uuid starting with one as an internal request and skips both the MCP Apps
+    # render path and the model-visibility filter (`INTERNAL_STUB_PREFIXES`).
+    # That check is correct for requests the gateway mints itself, so the gap is
+    # here: a stub that simply NAMES itself with the prefix at registration
+    # inherits the exemption and can list tools the model is meant not to see.
+    # Refused at the door, because the prefix is not a namespace a client may
+    # enter.
+    if stub_uuid.startswith(INTERNAL_STUB_PREFIXES):
+        await _write_json_line(
+            writer,
+            {"type": "rejected", "reason": "reserved stub_uuid prefix"},
+        )
+        logger.warning("rejected Register: reserved stub_uuid prefix %r", stub_uuid)
         return
 
     caller = _caller_from_register(register)

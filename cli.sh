@@ -12,21 +12,25 @@
 # venv). No unsigned/checksum-only fallback exists. Unlike install.sh (which
 # builds from a git clone), this pulls the published wheel.
 #
-# Python: uses the system interpreter (>=3.12) when one exists; otherwise — or
-# always, with --managed-python — provisions a python-build-standalone CPython
-# via a SHA-256-pinned uv into a user-owned directory. No package manager, no
-# sudo, works on old-glibc distros (CentOS 7).
+# Python: provisions a python-build-standalone CPython via a SHA-256-pinned uv
+# into a user-owned directory (the default) — no package manager, no sudo,
+# works on old-glibc distros (CentOS 7). Opt out with --system-python to run on
+# a system interpreter (>=3.12) instead; the choice is recorded and survives
+# updates. If the managed default cannot be provisioned (no network), the run
+# falls back to a usable system interpreter rather than failing.
 #
 # Options / env:
 #   --channel <nightly|insider|stable>   (default: stable; env KIROCREW_CHANNEL)
 #   --version <X.Y.Z>                    pin an exact version, verified against
 #                                        its immutable signed CLI manifest
 #   --cdn <base-url>                     (default CloudFront; env KIROCREW_CDN_BASE)
-#   --managed-python                     skip the system interpreters and run on
-#                                        a uv-provisioned Python instead (sticky:
-#                                        later runs and updates keep the choice;
-#                                        opt out with --system-python)
+#   --managed-python                     force the managed default back on after
+#                                        a recorded --system-python opt-out
 #                                        (env KIROCREW_MANAGED_PYTHON=1)
+#   --system-python                      run on the system interpreter instead
+#                                        of the managed default (sticky: later
+#                                        runs and updates keep the choice)
+#                                        (env KIROCREW_MANAGED_PYTHON=0)
 # ──────────────────────────────────────────────────────────────────────
 set -eu
 
@@ -46,8 +50,9 @@ ARTIFACT_BASE="${KIROCREW_CDN_BASE:-https://download.crew.kiro.dev}"
 CHANNEL="${KIROCREW_CHANNEL:-stable}"
 PIN_VERSION=""
 # Three states: "" = undecided (fall back to the persisted python-mode marker,
-# then to system), "1" = managed, "0" = system. An explicit env value or flag
-# always outranks the marker, so an operator can override a sticky choice.
+# then to the managed default), "1" = managed, "0" = system. An explicit env
+# value or flag always outranks the marker, so an operator can override a
+# sticky choice.
 MANAGED_PYTHON="${KIROCREW_MANAGED_PYTHON:-}"
 
 # Pinned uv release used to provision a managed Python interpreter when the
@@ -106,16 +111,22 @@ Options / env:
   --version <X.Y.Z>                    pin an exact version, verified against
                                        its immutable signed CLI manifest
   --cdn <base-url>                     (default CloudFront; env KIROCREW_CDN_BASE)
-  --managed-python                     skip the system interpreters and run on a
-                                       uv-provisioned Python instead (sticky: later
-                                       runs and updates keep the choice)
-  --system-python                      opt back out of a recorded managed-python
-                                       choice and use the system interpreter
+  --managed-python                     force the managed default back on after
+                                       a recorded --system-python opt-out
                                        (env KIROCREW_MANAGED_PYTHON=1)
+  --system-python                      run on the system interpreter (>=3.12)
+                                       instead of the managed default (sticky:
+                                       later runs and updates keep the choice)
+                                       (env KIROCREW_MANAGED_PYTHON=0)
   KIROCREW_VENV                        override the managed venv location
   KIROCREW_PYTHON_DIR                  override where uv-provisioned interpreters
                                        are stored (default: beside the data home,
                                        ~/.kiro/crew-python)
+  KIROCREW_UV_URL                      mirror base for the uv release tarballs
+                                       (default: the uv GitHub release tree; the
+                                       SHA-256 pin is enforced either way)
+  UV_PYTHON_INSTALL_MIRROR             mirror for the python-build-standalone
+                                       interpreter downloads (read by uv)
 EOF
       exit 0 ;;
     *) echo "kirocrew-install: unknown argument '$1'" >&2; exit 2 ;;
@@ -272,8 +283,13 @@ _provision_python_via_uv() {
     echo "Downloading uv $UV_VERSION ($_uv_target) ..."
     # -L: GitHub release assets redirect to a storage host; --proto-redir keeps
     # every hop on HTTPS (curl's redirect default would also allow plain http).
+    # KIROCREW_UV_URL points air-gapped / proxied hosts at a mirror of the uv
+    # release tree; the SHA-256 pin below still applies, so a mirror can serve
+    # the bytes but never substitute them. (uv's own python-build-standalone
+    # download honors UV_PYTHON_INSTALL_MIRROR, which inherits through env.)
+    _uv_base="${KIROCREW_UV_URL:-https://github.com/astral-sh/uv/releases/download}"
     curl -fsSL --proto '=https' --proto-redir '=https' \
-      "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$_uv_target.tar.gz" \
+      "${_uv_base%/}/$UV_VERSION/uv-$_uv_target.tar.gz" \
       -o "$TMP/uv.tar.gz" || return 1
     _uv_got="$($SHA_CMD "$TMP/uv.tar.gz" | awk '{print $1}')"
     [ "$_uv_got" = "$_uv_sha" ] \
@@ -306,26 +322,55 @@ PY=""
 # The interpreter choice is STICKY: a completed install records its mode in
 # the data home (next to `channel`), and a later run without an explicit flag
 # or env value reuses it. Without this, every re-run of the one-liner -- most
-# importantly the one `kirocrew update` performs -- would silently flip a
-# --managed-python install back onto whatever system interpreter it finds.
-# Opt back out explicitly with --system-python (or KIROCREW_MANAGED_PYTHON=0).
+# importantly the one `kirocrew update` performs -- would silently flip the
+# interpreter under an existing install.
+#
+# Managed is the DEFAULT: with no flag, no env value, and no recorded pin,
+# the installer provisions a python-build-standalone CPython via uv. Opt out
+# with --system-python (or KIROCREW_MANAGED_PYTHON=0), which records a
+# `system-pinned` marker so the choice survives updates. A bare `system`
+# marker is NOT an opt-out: earlier installers recorded it for every default
+# install, so it only says "an old default ran here" -- such installs migrate
+# onto the managed default at their next update.
 _DATA_HOME="${KIROCREW_HOME:-$HOME/.kiro/crew}"
 # The marker is agent-writable state, so the READ is guarded like the write:
 # only a plain regular file counts (a planted symlink -- e.g. to /dev/zero --
 # or a FIFO would wedge an unbounded read or spoof the mode), and the read is
 # bounded to the first bytes rather than slurping the file.
 _py_mode_file="$_DATA_HOME/python-mode"
-if [ -z "$MANAGED_PYTHON" ] && [ -f "$_py_mode_file" ] && [ ! -L "$_py_mode_file" ] \
-    && [ "$(head -c 16 "$_py_mode_file" 2>/dev/null || true)" = "managed" ]; then
-  echo "Reusing the recorded managed-python choice (override with --system-python)."
-  MANAGED_PYTHON=1
+# Tracks whether the resolved mode was ASKED FOR (flag, env, or recorded pin)
+# as opposed to defaulted. An explicit managed request fails hard when uv
+# cannot provision; the managed DEFAULT degrades to a system interpreter
+# instead, so flipping the default never turns a working install path into a
+# hard network dependency.
+PY_MODE_EXPLICIT=0
+PY_MODE_FALLBACK=0
+[ -n "$MANAGED_PYTHON" ] && PY_MODE_EXPLICIT=1
+if [ -z "$MANAGED_PYTHON" ] && [ -f "$_py_mode_file" ] && [ ! -L "$_py_mode_file" ]; then
+  case "$(head -c 16 "$_py_mode_file" 2>/dev/null || true)" in
+    managed)
+      echo "Reusing the recorded managed-python choice (override with --system-python)."
+      MANAGED_PYTHON=1; PY_MODE_EXPLICIT=1 ;;
+    system-pinned)
+      echo "Reusing the recorded system-python choice (override with --managed-python)."
+      MANAGED_PYTHON=0; PY_MODE_EXPLICIT=1 ;;
+  esac
 fi
-[ -n "$MANAGED_PYTHON" ] || MANAGED_PYTHON=0
+[ -n "$MANAGED_PYTHON" ] || MANAGED_PYTHON=1
 
 if [ "$MANAGED_PYTHON" = "1" ]; then
-  echo "managed-python: skipping system interpreters."
-  _provision_python_via_uv \
-    || err "could not provision a managed Python via uv. Check the network connection, or install Python >=3.12 yourself and re-run without --managed-python."
+  echo "Using a managed Python (the default; opt out with --system-python)."
+  if ! _provision_python_via_uv; then
+    if [ "$PY_MODE_EXPLICIT" = "1" ]; then
+      err "could not provision a managed Python via uv. Check the network connection, or re-run with --system-python to use a system interpreter instead."
+    fi
+    _resolve_python || true
+    if [ -n "$PY" ]; then
+      echo "kirocrew-install: WARNING: could not provision a managed Python (network?); using the system interpreter $PY for this run. The next run retries the managed default." >&2
+      MANAGED_PYTHON=0
+      PY_MODE_FALLBACK=1
+    fi
+  fi
 else
   _resolve_python || true
   if [ -z "$PY" ]; then
@@ -657,10 +702,15 @@ _write_marker() {
 _write_marker channel "$CHANNEL"
 # Record the interpreter mode so the next run -- including the re-run that
 # `kirocrew update` performs -- keeps the same choice without the flag.
+# `system-pinned` is only ever written for an EXPLICIT system choice; a
+# transient fallback from the managed default records nothing, so the next
+# run retries managed instead of freezing a network hiccup into a pin.
 if [ "$MANAGED_PYTHON" = "1" ]; then
   _write_marker python-mode managed
+elif [ "$PY_MODE_FALLBACK" = "1" ]; then
+  :
 else
-  _write_marker python-mode system
+  _write_marker python-mode system-pinned
 fi
 
 echo ""

@@ -48,6 +48,7 @@ def _run_cli_with_fake_env(
     with_uv: str | None = None,
     curl_stub: str | None = None,
     extra_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run cli.sh with a PATH that has NO usable python3 and a recording
     ``curl`` stub. Returns the process result plus the marker directory the
@@ -142,6 +143,7 @@ def _run_cli_with_fake_env(
         "PATH": str(tools),
         "HOME": str(tmp_path / "home"),
         "KIROCREW_HOME": str(tmp_path / "data-home"),
+        **(extra_env or {}),
     }
     argv = [str(tools / "sh"), str(CLI_SH), *(extra_args or [])]
     result = run_bounded(argv, env)
@@ -520,6 +522,116 @@ def test_cli_system_python_flag_overrides_the_recorded_choice(tmp_path: Path) ->
         assert "astral-sh/uv" not in curl_marker.read_text()
 
 
+_USABLE_PY312_STUB = (
+    "#!/bin/sh\n"
+    'case "$*" in\n'
+    "  *version_info*) exit 0 ;;\n"
+    "  *--version*) echo 'Python 3.12.0' ;;\n"
+    "  *) exit 0 ;;\n"
+    "esac\n"
+)
+
+
+def test_cli_defaults_to_managed_python(tmp_path: Path) -> None:
+    """With no flag, no env value, and no recorded pin, the installer must go
+    for the managed interpreter EVEN THOUGH a usable system python3.12 is on
+    PATH -- managed is the default, not the fallback."""
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    assert "Using a managed Python (the default" in combined
+    assert (markers / "curl").exists(), result.stderr
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
+
+
+def test_cli_legacy_system_marker_migrates_to_managed(tmp_path: Path) -> None:
+    """A bare `system` marker is what earlier installers recorded for EVERY
+    default install -- it is not an opt-out. Such installs must migrate onto
+    the managed default; only `system-pinned` (written by --system-python)
+    holds an install on the system interpreter."""
+    data_home = tmp_path / "data-home"
+    data_home.mkdir()
+    (data_home / "python-mode").write_text("system\n")
+
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    assert "Reusing the recorded system-python choice" not in combined
+    assert (markers / "curl").exists(), result.stderr
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
+
+
+def test_cli_system_pinned_marker_stays_on_system(tmp_path: Path) -> None:
+    """A recorded `system-pinned` marker (the --system-python opt-out) must
+    survive a flag-less re-run -- the exact shape `kirocrew update` performs --
+    and never reach for uv."""
+    data_home = tmp_path / "data-home"
+    data_home.mkdir()
+    (data_home / "python-mode").write_text("system-pinned\n")
+
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    assert "Reusing the recorded system-python choice" in combined
+    assert "Python >=3.12 is required" not in combined, combined
+    curl_marker = markers / "curl"
+    if curl_marker.exists():
+        assert "astral-sh/uv" not in curl_marker.read_text()
+
+
+def test_cli_default_managed_falls_back_to_system_on_provision_failure(
+    tmp_path: Path,
+) -> None:
+    """The managed DEFAULT must not turn a working install path into a hard
+    network dependency: when the uv download fails and a usable system
+    interpreter exists, the run degrades to it with a warning. Only an
+    EXPLICIT managed request (flag / env / recorded pin) fails hard -- that
+    contract is pinned by test_cli_managed_python_flag_skips_system_interpreters."""
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    # The uv download was attempted (default = managed) ...
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
+    # ... failed (recording curl exits 22), and the run degraded to the
+    # system interpreter instead of dying at the python gate.
+    assert "could not provision a managed Python (network?)" in combined
+    assert "Python >=3.12 is required" not in combined, combined
+    # A transient fallback must never freeze into a pin: the fallback branch
+    # writes no python-mode marker, so the next run retries managed.
+    text = CLI_SH.read_text()
+    assert '_write_marker python-mode system-pinned' in text
+    assert '_write_marker python-mode system\n' not in text
+    assert 'PY_MODE_FALLBACK' in text
+
+
+def test_cli_uv_download_honors_a_mirror_base(tmp_path: Path) -> None:
+    """KIROCREW_UV_URL points air-gapped / proxied hosts at a mirror of the uv
+    release tree. The URL must be built from it -- and the SHA-256 pin still
+    applies, so a mirror can serve the bytes but never substitute them (pinned
+    by test_cli_rejects_a_tampered_uv_download)."""
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        extra_env={"KIROCREW_UV_URL": "https://mirror.example.com/uv/"},
+    )
+
+    recorded = (markers / "curl").read_text()
+    assert "https://mirror.example.com/uv/" in recorded, result.stderr
+    assert "github.com/astral-sh" not in recorded
+    assert ".tar.gz" in recorded
+
+
 def _run_marker_write_shape(data_home: Path, tmp_path: Path) -> subprocess.CompletedProcess[bytes]:
     """Run the exact guarded marker-write shape cli.sh uses, targeting
     ``python-mode`` with value ``managed``. Contained under tmp_path."""
@@ -609,12 +721,13 @@ def test_cli_marker_write_refuses_a_directory_target(tmp_path: Path) -> None:
 def test_cli_marker_read_ignores_a_planted_symlink(tmp_path: Path) -> None:
     """The marker READ is guarded like the write: a planted symlink at
     python-mode (e.g. to /dev/zero, which would wedge an unbounded cat, or to
-    an attacker file spoofing 'managed') must be ignored -- the run proceeds
-    on the system interpreter as if no marker existed."""
+    an attacker file spoofing 'system-pinned' to freeze the install off the
+    managed default) must be ignored -- the run proceeds on the managed
+    default as if no marker existed."""
     data_home = tmp_path / "data-home"
     data_home.mkdir()
     spoof = tmp_path / "spoof"
-    spoof.write_text("managed\n")
+    spoof.write_text("system-pinned\n")
     (data_home / "python-mode").symlink_to(spoof)
 
     result, markers = _run_cli_with_fake_env(
@@ -632,10 +745,10 @@ def test_cli_marker_read_ignores_a_planted_symlink(tmp_path: Path) -> None:
     )
 
     combined = result.stdout + result.stderr
-    assert "Reusing the recorded managed-python choice" not in combined
-    curl_marker = markers / "curl"
-    if curl_marker.exists():
-        assert "astral-sh/uv" not in curl_marker.read_text()
+    assert "Reusing the recorded system-python choice" not in combined
+    # The spoofed pin was ignored: the run went for the managed default.
+    assert (markers / "curl").exists(), result.stderr
+    assert "astral-sh/uv" in (markers / "curl").read_text()
     # And the read guards must still be present in cli.sh.
     text = CLI_SH.read_text()
     assert '[ ! -L "$_py_mode_file" ]' in text

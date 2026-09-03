@@ -581,7 +581,10 @@ class TestFolderUpdate:
         def _boom(*_a: Any, **_kw: Any) -> Any:
             raise ArtifactError("folder index is corrupt")
 
-        monkeypatch.setattr(fstore, "rename", _boom)
+        # The handler's rename branch calls rename_and_icon_epoch (it needs the
+        # icon epoch the bump produced, under the same lock); rename() delegates
+        # to it. Patch what the handler actually invokes.
+        monkeypatch.setattr(fstore, "rename_and_icon_epoch", _boom)
         resp = await api_artifact_folder_update(
             _request(body={"name": "New"}, match={"id": folder["id"]})
         )

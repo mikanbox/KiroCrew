@@ -7,6 +7,7 @@ import hmac as _hmac  # noqa: F401
 import hmac as _hmac_mod
 import json
 import os
+import shutil
 import sys
 import textwrap
 import threading
@@ -947,7 +948,8 @@ async def test_sync_script_emits_step_markers():
     cmd_args = mock_start.call_args[0]
     script_cmd = cmd_args[1]
     assert script_cmd[0].endswith("python") or "python" in script_cmd[0]
-    script_src = script_cmd[2]
+    # The script is the LAST element: interpreter flags (`-I`) precede `-c`.
+    script_src = script_cmd[-1]
     assert "::step::" in script_src
     assert "print(f" in script_src
     repository_mod._UPSTREAM_REMOTE = None
@@ -999,6 +1001,12 @@ _SYNC_REPO = "/fake/main-checkout"
 #: other way, and asserting on it is how a leaked snapshot gets caught.
 _LAST_CLEANUP_PATHS: list[str] = []
 
+#: The full runner ARGV from the last ``_run_sync``, not just its script. The
+#: interpreter flags carry an invariant of their own (``-I``, which keeps the
+#: synced checkout off the runner's import path), and ``_run_sync``'s return value
+#: deliberately exposes only the script.
+_LAST_SYNC_CMD: list[str] = []
+
 
 async def _run_sync(mod, locked):
     """Drive _sync_start_locked with the probe stubbed; return its result dict
@@ -1025,7 +1033,13 @@ async def _run_sync(mod, locked):
         async with mod._SYNC_LOCK:
             result = await mod._sync_start_locked()
     repository_mod._UPSTREAM_REMOTE = None
-    script = mock_start.call_args[0][1][2] if mock_start.call_args else None
+    # The script is the LAST argv element, not a fixed index: the runner argv
+    # carries interpreter flags before `-c` (`-I`, which keeps the synced checkout
+    # off the runner's sys.path), and a positional index silently hands every test
+    # here a flag string instead of the script when one is added.
+    script = mock_start.call_args[0][1][-1] if mock_start.call_args else None
+    global _LAST_SYNC_CMD
+    _LAST_SYNC_CMD = list(mock_start.call_args[0][1]) if mock_start.call_args else []
     # Stubbing _start_run also stubs out its `finally` cleanup, so anything the
     # sync staged for removal (the dependency-only path snapshots dep_sync into a
     # temp dir) would outlive the test. Remove exactly what it registered, in the
@@ -1249,6 +1263,75 @@ def test_pythonioencoding_saves_a_step_child_that_prints_a_non_ascii_path():
     )
     assert pinned.returncode == 0, pinned.stderr.decode(errors="replace")
     assert path in pinned.stdout.decode(errors="replace")
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_runs_isolated_so_the_synced_tree_is_off_its_import_path():
+    """The runner interpreter carries `-I`, and that is a security boundary.
+
+    `python -c` puts the inherited cwd at sys.path[0], AHEAD of the stdlib, and the
+    cwd a module-style app backend hands down is the gateway's own source root —
+    which on the editable install Dev Fleet manages IS ``<checkout>/src``, the tree
+    being synced. The runner's own startup imports (`os`, `shutil`, `subprocess`,
+    `json`) resolve against that directory first, and the runner process is NOT
+    sandbox-wrapped: only the step argvs go through sandboxed_spawn_argv. Without
+    `-I`, a `src/shutil.py` an earlier sync landed — or that an agent wrote in the
+    checkout between syncs — runs arbitrary code there, outside the per-step
+    sandbox.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    assert script is not None
+    cmd = _LAST_SYNC_CMD
+    assert cmd[0] == sys.executable, cmd
+    # The flags between the interpreter and `-c`, which is the last thing before
+    # the script itself.
+    assert cmd[-2] == "-c", cmd
+    assert "-I" in cmd[1:-2], cmd
+
+
+@pytest.mark.asyncio
+async def test_runner_isolation_keeps_a_poisoned_cwd_out_of_the_runner(tmp_path):
+    """Prove the mechanism with the runner's OWN flags, not their presence in a list.
+
+    Runs the flags the sync actually passes, from a working directory carrying a
+    `shutil.py` that writes a file when executed, against the shape the runner uses
+    — a `-c` program whose top-level `import shutil` resolves through sys.path. The
+    stdlib must win and the payload must not run.
+    """
+    import subprocess
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    await _run_sync(mod, [])
+    flags = _LAST_SYNC_CMD[1:-2]
+
+    poisoned = tmp_path / "checkout-src"
+    poisoned.mkdir()
+    (poisoned / "shutil.py").write_text(
+        "import pathlib\n"
+        "pathlib.Path(__file__).with_name('PAYLOAD-RAN').write_text('x')\n"
+        "def rmtree(*_a, **_k):\n"
+        "    raise AssertionError('shadowed shutil was used')\n",
+        encoding="utf-8",
+    )
+    # The runner's own first line, verbatim in shape: the imports it performs at
+    # startup, before any step has run.
+    body = "import os, shutil, subprocess, sys, json\nprint(shutil.__file__)\n"
+    # cwd under tmp_path, never the repo root a child would otherwise inherit from
+    # pytest: the payload writes beside itself, and this is where it must not land.
+    proc = subprocess.run(
+        [sys.executable, *flags, "-c", body],
+        cwd=str(poisoned),
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+    assert not (poisoned / "PAYLOAD-RAN").exists(), "checkout code ran in the runner"
+    assert str(poisoned) not in proc.stdout.decode(errors="replace")
 
 
 # --- repo owner/name parsing ---
@@ -2126,6 +2209,10 @@ def test_escalation_cleanup_removes_empty_builtin_via_pinned_fd(tmp_path, monkey
 def _assert_git_neutralizers(env):
     assert env["GIT_ALLOW_PROTOCOL"] == "https:ssh"
     assert env["GIT_PROTOCOL_FROM_USER"] == "0"
+    # Not a config key and not about code execution: it pins WHICH OBJECT GRAPH
+    # git answers from, so every answer this handler acts on describes the
+    # history the checkout actually holds rather than a grafted substitute.
+    assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
     # Full config-driven-execution neutralizer set, injected as env so it
     # covers EVERY git call (background fetch, rebase, sync pull included).
     pairs = {
@@ -3219,6 +3306,9 @@ def test_git_env_neutralizers_present():
     n = mod._GIT_ENV_NEUTRALIZERS
     assert n["GIT_ALLOW_PROTOCOL"] == "https:ssh"
     assert n["GIT_PROTOCOL_FROM_USER"] == "0"
+    assert n["GIT_NO_REPLACE_OBJECTS"] == "1"
+    # GIT_NO_REPLACE_OBJECTS is an env var in its own right, NOT one of the
+    # config pairs, so the count must not have grown to cover it.
     assert n["GIT_CONFIG_COUNT"] == "4"
     assert n["GIT_CONFIG_KEY_0"] == "core.fsmonitor"
     assert n["GIT_CONFIG_VALUE_0"] == "false"
@@ -3228,6 +3318,100 @@ def test_git_env_neutralizers_present():
     assert n["GIT_CONFIG_VALUE_2"] == ""
     assert n["GIT_CONFIG_KEY_3"] == "core.sshCommand"
     assert n["GIT_CONFIG_VALUE_3"] == "ssh"
+
+
+@pytest.mark.skipif(
+    shutil.which("git") is None,
+    reason="git is required to exercise a real refs/replace graft",
+)
+def test_the_neutralizers_answer_from_the_real_object_graph(tmp_path, monkeypatch):
+    """A ``refs/replace`` graft must not change what Dev Fleet's git reads report.
+
+    Pinned by BEHAVIOUR against a real repository rather than by asserting the
+    variable is present, because the claim is about git's own semantics: a
+    ``refs/replace/<oid>`` ref substitutes one object for another in EVERY read, so
+    ``rev-list --count`` walks the substitute's parents and answers about a history
+    no checked-out commit names. Dev Fleet acts on exactly that number -- it is how
+    "behind by N commits" and the sync's own decisions are formed -- so the real
+    graph is the only one that answers the question asked.
+
+    The unpinned reading is asserted too, so this test fails if git ever stops
+    honouring the graft and the pin becomes a no-op nobody would notice.
+    """
+    import subprocess
+
+    git = shutil.which("git")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # An exported GIT_DIR/GIT_WORK_TREE is PLANTED rather than assumed absent,
+    # because it is what makes the allowlist below observable instead of a claim.
+    # This decoy stands in for the operator's real checkout: drop the filtering
+    # and every ``run()`` retargets here, so the suite mutates a repository
+    # outside tmp_path and the graft assertions answer about a history this test
+    # never built.
+    decoy = tmp_path / "decoy.git"
+    decoy.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(decoy))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "decoy-work"))
+
+    # The base env is the module's OWN allowlist (`_is_safe_env_key`, what
+    # `_build_env` filters through) rather than a merge over `os.environ`,
+    # because git takes its location from the environment and those variables
+    # outrank ``-C <repo>``: an exported ``GIT_DIR``, ``GIT_WORK_TREE`` or
+    # ``GIT_INDEX_FILE`` would send the ``add``/``commit``/``replace`` below at an
+    # unrelated repository, so running the suite would mutate an operator's real
+    # index and refs. ``GIT_REPLACE_REF_BASE`` and ``GIT_NO_REPLACE_OBJECTS``
+    # would also decide the graft assertions before they were made. An allowlist
+    # removes the whole class in one place, including any variable git adds later.
+    #
+    # Global and system config are excluded for the mirror-image reason: a
+    # ``commit.gpgsign`` or ``core.hooksPath`` in the operator's ``~/.gitconfig``
+    # would fail these fixture commits on their machine and nowhere else.
+    # Repository-local config still applies, which is what the identity below is
+    # set through.
+    base_env = {k: v for k, v in os.environ.items() if mod._is_safe_env_key(k)}
+    base_env["GIT_CONFIG_GLOBAL"] = os.devnull
+    base_env["GIT_CONFIG_SYSTEM"] = os.devnull
+
+    def run(*args, env=None):
+        proc = subprocess.run(
+            [git, "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            env={**base_env, **(env or {})},
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.strip()
+
+    run("init", "-q")
+    run("config", "user.email", "t@example.invalid")
+    run("config", "user.name", "T")
+    oids = []
+    for i in range(3):
+        (repo / "f.txt").write_text(f"{i}\n", encoding="utf-8")
+        run("add", "f.txt")
+        run("commit", "-q", "-m", f"c{i}")
+        oids.append(run("rev-parse", "HEAD"))
+
+    # Three commits, so HEAD's history is three deep.
+    assert run("rev-list", "--count", "HEAD") == "3"
+    # Graft HEAD onto the root, which shortens the history git reports.
+    run("replace", "--graft", oids[2], oids[0])
+
+    # Ungrafted the reading is the truth; grafted it is not. Both are asserted so
+    # neither half of the pin can rot silently.
+    assert run("rev-list", "--count", "HEAD") == "2"
+    assert (
+        run("rev-list", "--count", "HEAD", env={"GIT_NO_REPLACE_OBJECTS": "1"}) == "3"
+    )
+    assert run("rev-list", "--count", "HEAD", env=mod._GIT_ENV_NEUTRALIZERS) == "3"
+
+    # Nothing reached the decoy, so the allowlist rather than luck is what kept
+    # every mutation above inside tmp_path.
+    assert list(decoy.iterdir()) == [], "an inherited GIT_DIR retargeted the fixture"
 
 
 # =============================================================================

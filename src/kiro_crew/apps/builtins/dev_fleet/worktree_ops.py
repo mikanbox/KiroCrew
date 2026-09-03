@@ -1987,7 +1987,28 @@ async def _sync_start_locked() -> dict:
         "    if rc != 0:\n"
         "        sys.exit(rc)\n"
     )
-    cmd = [sys.executable, "-c", script]
+    # `-I`, for the same reason the npm_preflight snapshot step above carries it:
+    # it takes the WORKING DIRECTORY off this program's sys.path.
+    #
+    # `python -c` otherwise puts the inherited cwd at sys.path[0], AHEAD of the
+    # standard library, and the cwd this run inherits is inside the checkout being
+    # synced -- apps/backend.py starts a module-style builtin with cwd at the
+    # gateway's own source root, which on the editable install Dev Fleet exists to
+    # manage IS `<checkout>/src`. So the runner's own startup imports (`os`,
+    # `shutil`, `subprocess`, `json`) resolve against that directory first, and a
+    # `src/shutil.py` there executes arbitrary code in THIS process -- which is the
+    # one process here the per-step sandbox does not cover, since only the step
+    # argvs go through `sandboxed_spawn_argv`. The shadowing module only has to be
+    # on disk when the runner STARTS, so a revision an earlier sync already landed,
+    # or anything an agent wrote in the checkout between syncs, is enough; it does
+    # not have to win a race with this run's own merge.
+    #
+    # Set on the interpreter rather than scrubbed inside the script so it covers
+    # the process for its whole life, including any import the runner grows later
+    # after a step that has already merged untrusted content. Free of cost: this
+    # program is stdlib-only by design, and `-E`/`-s` (which `-I` implies) remove
+    # env and user-site import sources it never uses either.
+    cmd = [sys.executable, "-I", "-c", script]
     rid = await runtime._start_run(
         runtime._SYNC_RUN_LABEL, cmd, env=runtime._build_env(), cleanup_paths=cleanups
     )

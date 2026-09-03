@@ -321,13 +321,22 @@ class TestRedactCredentials:
         """
         from kiro_crew import security
 
+        # Scope this ratchet to CREDENTIAL tags only, not every `_REDACTED_*_TAG`
+        # constant. ``CREDENTIAL_REDACTION_TAGS`` has credential semantics: the
+        # Slack/iMessage/dashboard consumers that count it post a "a credential
+        # was replaced" notice. A future non-credential placeholder (e.g. an
+        # exfiltration-URL or PII tag named `_REDACTED_URL_TAG`) must NOT be
+        # forced into this tuple, or those surfaces would emit credential wording
+        # for a non-credential redaction. So we match on the `_CREDENTIAL_TAG`
+        # suffix, which names exactly the family the tuple is meant to hold; add a
+        # sibling family here only when it also belongs in the credential tuple.
         declared = {
             name: value
             for name, value in vars(security).items()
-            if name.startswith("_REDACTED_") and name.endswith("_TAG")
+            if name.startswith("_REDACTED_") and name.endswith("_CREDENTIAL_TAG")
             if isinstance(value, str)
         }
-        assert declared, "tag-constant naming changed; this ratchet no longer sees them"
+        assert declared, "credential tag-constant naming changed; this ratchet no longer sees them"
 
         unregistered = {
             name: value
@@ -335,9 +344,9 @@ class TestRedactCredentials:
             if value not in security.CREDENTIAL_REDACTION_TAGS
         }
         assert not unregistered, (
-            "redaction tag(s) not in CREDENTIAL_REDACTION_TAGS: "
+            "credential redaction tag(s) not in CREDENTIAL_REDACTION_TAGS: "
             f"{sorted(unregistered)} -- add them there so consumers that ask "
-            "'was anything redacted' (e.g. the dashboard chat notice) can see them"
+            "'was a credential redacted' (e.g. the dashboard chat notice) can see them"
         )
 
     def test_pass_two_emits_a_registered_tag(self) -> None:
